@@ -1,0 +1,31 @@
+# Rust
+/target
+**/*.rs.bk
+
+# .NET
+**/bin/
+**/obj/
+*.user
+*.pdb
+
+# IDE / tooling
+.claude/settings.local.json
+.vs/
+.idea/
+*.suo
+
+# Installer build artifacts.
+#   - installer/deps/  caches the downloaded OpenVPN MSI (~6 MB)
+#   - installer/Output/ holds the produced VpnClientSetup-*.exe (~75 MB)
+# Both are reproducible from source via installer/build.ps1.
+/installer/deps/
+/installer/Output/
+
+# User-side secrets: .ovpn profiles imported by users (often hold private
+# keys inline) and anything at the workspace root with that extension.
+/*.ovpn
+*.ovpn.bak
+
+# OS noise
+Thumbs.db
+.DS_Store

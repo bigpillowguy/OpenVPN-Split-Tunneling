@@ -1,0 +1,221 @@
+<ui:FluentWindow x:Class="VpnClient.Ui.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+        xmlns:local="clr-namespace:VpnClient.Ui"
+        mc:Ignorable="d"
+        Title="OpenVPN Split Tunneling Client"
+        Height="620" Width="900"
+        WindowBackdropType="Mica"
+        WindowCornerPreference="Round"
+        ExtendsContentIntoTitleBar="True">
+
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <ui:TitleBar Grid.Row="0" Title="OpenVPN Split Tunneling Client" />
+
+        <Grid Grid.Row="1" Margin="24,12,24,24">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+            </Grid.RowDefinitions>
+
+            <!-- Header: VPN state + Connect -->
+            <Border Grid.Row="0"
+                    Background="{DynamicResource ControlFillColorDefaultBrush}"
+                    CornerRadius="8"
+                    Padding="20,16">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <StackPanel Grid.Column="0">
+                        <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                            <Ellipse x:Name="StateDot" Width="12" Height="12" Fill="Gray" Margin="0,0,12,0" />
+                            <ui:ProgressRing x:Name="StateSpinner"
+                                             IsIndeterminate="True"
+                                             Width="16" Height="16"
+                                             Margin="0,0,12,0"
+                                             Visibility="Collapsed" />
+                            <ui:TextBlock x:Name="StateText"
+                                          Text="Connecting to redirector…"
+                                          FontTypography="Subtitle" />
+                        </StackPanel>
+                        <ui:TextBlock x:Name="AdapterText"
+                                      Text=""
+                                      FontTypography="Body"
+                                      Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                      Margin="24,4,0,0" />
+                    </StackPanel>
+                    <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                        <ui:Button x:Name="VpnSettingsBtn"
+                                   Icon="{ui:SymbolIcon Settings20}"
+                                   Appearance="Secondary"
+                                   ToolTip="VPN profiles &amp; .ovpn imports"
+                                   Click="VpnSettingsBtn_Click"
+                                   Margin="0,0,8,0" />
+                        <ui:Button x:Name="ConnectBtn"
+                                   Content="Connect"
+                                   Icon="{ui:SymbolIcon Play20}"
+                                   Appearance="Primary"
+                                   IsEnabled="False"
+                                   Click="ConnectBtn_Click"
+                                   ToolTip="Connect using the last-used profile (or the first one if you haven't connected yet)" />
+                    </StackPanel>
+                </Grid>
+            </Border>
+
+            <!-- Stats row -->
+            <Grid Grid.Row="1" Margin="0,16,0,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="16" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="16" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+
+                <Border Grid.Column="0" Background="{DynamicResource ControlFillColorDefaultBrush}" CornerRadius="8" Padding="16">
+                    <StackPanel>
+                        <ui:TextBlock Text="Total Out" Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
+                        <ui:TextBlock x:Name="BytesOutText" Text="0 B" FontTypography="Subtitle" Margin="0,4,0,0" />
+                    </StackPanel>
+                </Border>
+                <Border Grid.Column="2" Background="{DynamicResource ControlFillColorDefaultBrush}" CornerRadius="8" Padding="16">
+                    <StackPanel>
+                        <ui:TextBlock Text="Total In" Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
+                        <ui:TextBlock x:Name="BytesInText" Text="0 B" FontTypography="Subtitle" Margin="0,4,0,0" />
+                    </StackPanel>
+                </Border>
+                <Border Grid.Column="4" Background="{DynamicResource ControlFillColorDefaultBrush}" CornerRadius="8" Padding="16">
+                    <StackPanel>
+                        <ui:TextBlock Text="Uptime" Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
+                        <ui:TextBlock x:Name="UptimeText" Text="—" FontTypography="Subtitle" Margin="0,4,0,0" />
+                    </StackPanel>
+                </Border>
+            </Grid>
+
+            <!-- Apps section -->
+            <Border Grid.Row="2"
+                    Margin="0,16,0,0"
+                    Background="{DynamicResource ControlFillColorDefaultBrush}"
+                    CornerRadius="8"
+                    Padding="20,16">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                    </Grid.RowDefinitions>
+                    <Grid Grid.Row="0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <ui:TextBlock Grid.Column="0" Text="Tunneled Apps" FontTypography="Subtitle" />
+                        <ui:Button Grid.Column="1"
+                                   x:Name="ManageAppsBtn"
+                                   Content="Manage"
+                                   Icon="{ui:SymbolIcon Settings20}"
+                                   Click="SettingsBtn_Click" />
+                    </Grid>
+
+                    <ScrollViewer Grid.Row="1" Margin="0,12,0,0" VerticalScrollBarVisibility="Auto">
+                        <ItemsControl x:Name="AppsList">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <ui:CardExpander Margin="0,0,0,8" IsExpanded="False">
+                                        <ui:CardExpander.Header>
+                                            <Grid>
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="*" />
+                                                    <ColumnDefinition Width="Auto" />
+                                                </Grid.ColumnDefinitions>
+                                                <StackPanel Grid.Column="0" VerticalAlignment="Center">
+                                                    <ui:TextBlock Text="{Binding DisplayName}" FontTypography="BodyStrong" />
+                                                    <ui:TextBlock Text="{Binding ProcessCountText}"
+                                                                  FontTypography="Caption"
+                                                                  Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                                                  Margin="0,2,0,0" />
+                                                </StackPanel>
+                                                <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                                                    <StackPanel Margin="0,0,24,0" HorizontalAlignment="Right">
+                                                        <ui:TextBlock Text="{Binding RateOutText}"
+                                                                      FontTypography="Caption"
+                                                                      Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
+                                                        <ui:TextBlock Text="{Binding TotalOutText}" FontTypography="Body" />
+                                                    </StackPanel>
+                                                    <StackPanel HorizontalAlignment="Right">
+                                                        <ui:TextBlock Text="{Binding RateInText}"
+                                                                      FontTypography="Caption"
+                                                                      Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
+                                                        <ui:TextBlock Text="{Binding TotalInText}" FontTypography="Body" />
+                                                    </StackPanel>
+                                                </StackPanel>
+                                            </Grid>
+                                        </ui:CardExpander.Header>
+
+                                        <ItemsControl ItemsSource="{Binding Pids}" Margin="0,0,0,0">
+                                            <ItemsControl.ItemTemplate>
+                                                <DataTemplate>
+                                                    <Grid Margin="0,6">
+                                                        <Grid.ColumnDefinitions>
+                                                            <ColumnDefinition Width="*" />
+                                                            <ColumnDefinition Width="Auto" />
+                                                        </Grid.ColumnDefinitions>
+                                                        <ui:TextBlock Grid.Column="0"
+                                                                      Text="{Binding PidText}"
+                                                                      Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                                                      VerticalAlignment="Center"
+                                                                      FontTypography="Caption" />
+                                                        <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                                                            <StackPanel Margin="0,0,24,0" HorizontalAlignment="Right">
+                                                                <ui:TextBlock Text="{Binding RateOutText}"
+                                                                              FontTypography="Caption"
+                                                                              Foreground="{DynamicResource TextFillColorTertiaryBrush}" />
+                                                                <ui:TextBlock Text="{Binding TotalOutText}" FontTypography="Caption" />
+                                                            </StackPanel>
+                                                            <StackPanel HorizontalAlignment="Right">
+                                                                <ui:TextBlock Text="{Binding RateInText}"
+                                                                              FontTypography="Caption"
+                                                                              Foreground="{DynamicResource TextFillColorTertiaryBrush}" />
+                                                                <ui:TextBlock Text="{Binding TotalInText}" FontTypography="Caption" />
+                                                            </StackPanel>
+                                                        </StackPanel>
+                                                    </Grid>
+                                                </DataTemplate>
+                                            </ItemsControl.ItemTemplate>
+                                        </ItemsControl>
+                                    </ui:CardExpander>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </ScrollViewer>
+
+                    <ui:TextBlock x:Name="EmptyAppsText"
+                                  Grid.Row="1"
+                                  Margin="0,24,0,0"
+                                  HorizontalAlignment="Center"
+                                  VerticalAlignment="Center"
+                                  Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                  Text="No tunneled apps yet — click Manage to add one"
+                                  Visibility="Collapsed" />
+                </Grid>
+            </Border>
+        </Grid>
+
+        <Border Grid.Row="2" Padding="24,8" BorderBrush="{DynamicResource ControlStrokeColorDefaultBrush}" BorderThickness="0,1,0,0">
+            <ui:TextBlock x:Name="FooterText"
+                          Text="OpenVPN Split Tunneling Client"
+                          Foreground="{DynamicResource TextFillColorTertiaryBrush}" />
+        </Border>
+    </Grid>
+</ui:FluentWindow>

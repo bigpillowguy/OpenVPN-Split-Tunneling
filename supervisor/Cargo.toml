@@ -1,0 +1,13 @@
+[package]
+name = "supervisor"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+prost.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+windows.workspace = true
+ipc = { path = "../ipc" }
