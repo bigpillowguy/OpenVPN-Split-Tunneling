@@ -25,13 +25,14 @@ pub async fn run(
     tracing::info!("proc watcher running (polls every {:?})", POLL_INTERVAL);
 
     let mut sys = System::new_all();
-    let mut auto_tunneled: HashSet<u32> = HashSet::new();
     let mut last_config_load = std::time::Instant::now() - CONFIG_RELOAD_INTERVAL;
 
     loop {
         if last_config_load.elapsed() >= CONFIG_RELOAD_INTERVAL {
-            let from_disk = tunneled::load_from_disk();
-            tunneled::replace(&tunneled_paths, from_disk);
+            match tunneled::load_from_disk() {
+                Ok(from_disk) => tunneled::replace(&tunneled_paths, from_disk),
+                Err(error) => tracing::warn!(%error, "keeping last valid tunnel configuration"),
+            }
             last_config_load = std::time::Instant::now();
         }
 
@@ -44,31 +45,22 @@ pub async fn run(
         // Snapshot the path list so we don't hold the read lock during sysinfo
         // iteration (which can be a few ms on a busy box).
         let paths: Vec<PathBuf> = tunneled_paths.read().unwrap().clone();
+        let mut auto_tunneled = HashSet::new();
         for (pid, process) in sys.processes() {
             let pid_u32 = pid.as_u32();
-            if auto_tunneled.contains(&pid_u32) {
-                continue;
-            }
             let Some(exe) = process.exe() else { continue };
             if !path_matches_any(exe, &paths) {
                 continue;
             }
             let path_str = exe.to_string_lossy().to_string();
-            tracing::info!("auto-tunnel (poll): pid={} matches {:?}", pid_u32, exe);
-            policy::add(&policy_state, pid_u32);
             bus.pid_paths.insert(pid_u32, path_str);
             auto_tunneled.insert(pid_u32);
         }
 
-        let still_alive: HashSet<u32> = sys
-            .processes()
-            .keys()
-            .map(|p| p.as_u32())
-            .collect();
-        auto_tunneled.retain(|p| still_alive.contains(p));
-        bus.pid_paths.retain(|p, _| still_alive.contains(p));
-        bus.pid_bytes_out.retain(|p, _| still_alive.contains(p));
-        bus.pid_bytes_in.retain(|p, _| still_alive.contains(p));
+        policy::replace(&policy_state, auto_tunneled.iter().copied());
+        bus.pid_paths.retain(|p, _| auto_tunneled.contains(p));
+        bus.pid_bytes_out.retain(|p, _| auto_tunneled.contains(p));
+        bus.pid_bytes_in.retain(|p, _| auto_tunneled.contains(p));
 
         tokio::time::sleep(POLL_INTERVAL).await;
     }

@@ -5,20 +5,30 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
-use ipc::status::{status_message::Body, AppStats, PidStats, Snapshot, StatusMessage, Totals, VpnState};
-use ipc::STATUS_PIPE_NAME;
-use tokio::io::AsyncWriteExt;
-use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
-use windows::core::{w, BOOL};
-use windows::Win32::Foundation::{LocalFree, HLOCAL};
-use windows::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+use ipc::status::{
+    status_message::Body, AppStats, PidStats, Snapshot, StatusMessage, Totals, VpnState,
 };
-use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+use ipc::STATUS_PIPE_NAME;
+use prost::Message;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+use windows::core::{BOOL, PCWSTR, PWSTR};
+use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
+use windows::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
+use windows::Win32::Security::{
+    GetTokenInformation, TokenUser, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY,
+    TOKEN_USER,
+};
+use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 use crate::vpn_state::{self, VpnState as VpnStateHandle};
 
 const TICK: Duration = Duration::from_millis(500);
+const MAX_CLIENTS: usize = 4;
+const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_FRAME: usize = 1024 * 1024;
 
 pub struct StatusBus {
     pub bytes_out: Arc<AtomicU64>,
@@ -63,12 +73,17 @@ struct SecurityDescriptor {
 }
 
 impl SecurityDescriptor {
-    fn allow_authenticated_users() -> Result<Self> {
+    fn current_user() -> Result<Self> {
+        let sid = current_user_sid()?;
+        let sddl: Vec<u16> = format!("D:P(A;;GA;;;SY)(A;;GA;;;{sid})")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
         let mut psd = PSECURITY_DESCRIPTOR::default();
         unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                w!("D:(A;;GA;;;AU)"),
-                SDDL_REVISION_1 as u32,
+                PCWSTR(sddl.as_ptr()),
+                SDDL_REVISION_1,
                 &mut psd,
                 None,
             )
@@ -86,6 +101,41 @@ impl SecurityDescriptor {
     }
 }
 
+fn current_user_sid() -> Result<String> {
+    struct Token(HANDLE);
+    impl Drop for Token {
+        fn drop(&mut self) {
+            let _ = unsafe { CloseHandle(self.0) };
+        }
+    }
+    let mut raw = HANDLE::default();
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw) }?;
+    let token = Token(raw);
+    let mut bytes = 0;
+    let _ = unsafe { GetTokenInformation(token.0, TokenUser, None, 0, &mut bytes) };
+    anyhow::ensure!(
+        bytes as usize >= std::mem::size_of::<TOKEN_USER>(),
+        "invalid token user size"
+    );
+    // Win32 requires aligned TOKEN_USER storage (Vec<u8> does not promise it).
+    let mut buffer = vec![0usize; (bytes as usize).div_ceil(std::mem::size_of::<usize>())];
+    unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenUser,
+            Some(buffer.as_mut_ptr().cast()),
+            bytes,
+            &mut bytes,
+        )
+    }?;
+    let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+    let mut sid = PWSTR::null();
+    unsafe { ConvertSidToStringSidW(user.User.Sid, &mut sid) }?;
+    let result = unsafe { sid.to_string() };
+    let _ = unsafe { LocalFree(Some(HLOCAL(sid.0.cast()))) };
+    Ok(result?)
+}
+
 impl Drop for SecurityDescriptor {
     fn drop(&mut self) {
         unsafe {
@@ -100,6 +150,7 @@ unsafe impl Sync for SecurityDescriptor {}
 fn create_pipe(sd: &SecurityDescriptor, first: bool) -> Result<NamedPipeServer> {
     let attrs = sd.attrs();
     let mut opts = ServerOptions::new();
+    opts.reject_remote_clients(true);
     if first {
         opts.first_pipe_instance(true);
     }
@@ -110,18 +161,28 @@ fn create_pipe(sd: &SecurityDescriptor, first: bool) -> Result<NamedPipeServer> 
 }
 
 pub async fn run(bus: Arc<StatusBus>, vpn_state: VpnStateHandle) -> Result<()> {
-    let sd = SecurityDescriptor::allow_authenticated_users()?;
+    let sd = SecurityDescriptor::current_user()?;
     let mut server = create_pipe(&sd, true)?;
     tracing::info!("status pipe server listening on {}", STATUS_PIPE_NAME);
 
+    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CLIENTS));
+    let mut clients = tokio::task::JoinSet::new();
     loop {
-        server.connect().await.context("status pipe accept failed")?;
+        tokio::select! {
+            result = server.connect() => result.context("status pipe accept failed")?,
+            _ = clients.join_next(), if !clients.is_empty() => continue,
+        }
         let connected = server;
         server = create_pipe(&sd, false)?;
+        let Ok(permit) = permits.clone().try_acquire_owned() else {
+            drop(connected);
+            continue;
+        };
 
         let bus = bus.clone();
         let vpn_state = vpn_state.clone();
-        tokio::spawn(async move {
+        clients.spawn(async move {
+            let _permit = permit;
             if let Err(e) = handle_client(connected, bus, vpn_state).await {
                 tracing::warn!("status client disconnected: {}", e);
             }
@@ -142,12 +203,15 @@ async fn handle_client(
         frame_buf.clear();
         let now = Instant::now();
         let elapsed = now.duration_since(prev_sample).as_secs_f64().max(0.001);
-        let (msg, snapshot_pids) =
-            build_snapshot(&bus, &vpn_state, &prev_pids, elapsed);
+        let (msg, snapshot_pids) = build_snapshot(&bus, &vpn_state, &prev_pids, elapsed);
         prev_pids = snapshot_pids;
         prev_sample = now;
+        anyhow::ensure!(
+            msg.encoded_len() <= MAX_FRAME - 4,
+            "status frame exceeds limit"
+        );
         ipc::encode_status_frame(&msg, &mut frame_buf);
-        if let Err(e) = pipe.write_all(&frame_buf).await {
+        if let Err(e) = write_frame(&mut pipe, &frame_buf, WRITE_TIMEOUT).await {
             if matches!(
                 e.kind(),
                 std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::UnexpectedEof
@@ -156,14 +220,23 @@ async fn handle_client(
             }
             return Err(e.into());
         }
-        if let Err(e) = pipe.flush().await {
-            if matches!(e.kind(), std::io::ErrorKind::BrokenPipe) {
-                return Ok(());
-            }
-            return Err(e.into());
-        }
         tokio::time::sleep(TICK).await;
     }
+}
+
+async fn write_frame<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    frame: &[u8],
+    deadline: Duration,
+) -> std::io::Result<()> {
+    tokio::time::timeout(deadline, async {
+        writer.write_all(frame).await?;
+        writer.flush().await
+    })
+    .await
+    .map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::TimedOut, "status client is not reading")
+    })?
 }
 
 fn build_snapshot(
@@ -201,8 +274,16 @@ fn build_snapshot(
     for entry in bus.pid_paths.iter() {
         let pid = *entry.key();
         let path = entry.value().clone();
-        let out = bus.pid_bytes_out.get(&pid).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
-        let in_ = bus.pid_bytes_in.get(&pid).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
+        let out = bus
+            .pid_bytes_out
+            .get(&pid)
+            .map(|c| c.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        let in_ = bus
+            .pid_bytes_in
+            .get(&pid)
+            .map(|c| c.load(Ordering::Relaxed))
+            .unwrap_or(0);
         let prev = prev_pids.get(&pid).copied().unwrap_or((out, in_));
         let bps_out = ((out.saturating_sub(prev.0)) as f64 / elapsed_s).max(0.0) as u64;
         let bps_in = ((in_.saturating_sub(prev.1)) as f64 / elapsed_s).max(0.0) as u64;
@@ -220,7 +301,7 @@ fn build_snapshot(
         .into_iter()
         .map(|(path, mut pids)| {
             // Most-active first inside each app.
-            pids.sort_by(|a, b| (b.bytes_out + b.bytes_in).cmp(&(a.bytes_out + a.bytes_in)));
+            pids.sort_by_key(|p| std::cmp::Reverse(p.bytes_out.saturating_add(p.bytes_in)));
             let active = pids.len() as u32;
             let total_out: u64 = pids.iter().map(|p| p.bytes_out).sum();
             let total_in: u64 = pids.iter().map(|p| p.bytes_in).sum();
@@ -273,4 +354,22 @@ fn unix_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn stalled_client_hits_write_deadline() {
+        let (mut writer, _reader) = tokio::io::duplex(1);
+        let error = write_frame(&mut writer, &[0; 16], Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+    #[test]
+    fn status_acl_uses_current_account() {
+        assert!(current_user_sid().unwrap().starts_with("S-1-"));
+        SecurityDescriptor::current_user().unwrap();
+    }
 }

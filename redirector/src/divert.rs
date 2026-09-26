@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -17,7 +17,7 @@ use windivert::prelude::*;
 use windivert_sys::ChecksumFlags;
 
 use crate::adapter::VpnTarget;
-use crate::flows::{self, FlowEntry, FlowTable, LocalEndpoint, PROTO_TCP, PROTO_UDP};
+use crate::flows::{self, FlowTable, PROTO_TCP, PROTO_UDP};
 use crate::pidlookup;
 use crate::policy::{self, PolicyState};
 use crate::process::Resolver;
@@ -29,6 +29,11 @@ use crate::vpn_state::{self, VpnState};
 const BRIDGE_CHANNEL_DEPTH: usize = 64;
 const SMOLTCP_CHUNK: usize = 16 * 1024;
 const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const TCP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+const FLOW_REVALIDATE_INTERVAL: Duration = Duration::from_millis(250);
+const MAX_TCP_FLOWS: usize = 1024;
+const MAX_UDP_FLOWS: usize = 4096;
+const STATS_INTERVAL: Duration = Duration::from_secs(5);
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(
@@ -38,16 +43,13 @@ pub fn run(
     bus: Arc<StatusBus>,
     resolver: Arc<Resolver>,
     tunneled_paths: TunneledPaths,
+    shutdown: crate::shutdown::Shutdown,
 ) -> Result<()> {
     let capture_filter = "outbound and ip and (tcp or udp) and !loopback";
     let capture = WinDivert::network(capture_filter, 1040, WinDivertFlags::new())
         .context("WinDivert::network capture handle failed (need admin)")?;
-    let inject = WinDivert::network(
-        "false",
-        1039,
-        WinDivertFlags::new().set_send_only(),
-    )
-    .context("WinDivert::network inject handle failed")?;
+    let inject = WinDivert::network("false", 1039, WinDivertFlags::new().set_send_only())
+        .context("WinDivert::network inject handle failed")?;
 
     tracing::info!(
         "divert: capture+inject open, filter={}, smoltcp mode",
@@ -63,7 +65,10 @@ pub fn run(
         smoltcp::time::Instant::now(),
     );
     iface.update_ip_addrs(|addrs| {
-        let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(Ipv4Address::new(0, 0, 0, 0)), 0));
+        let _ = addrs.push(IpCidr::new(
+            IpAddress::Ipv4(Ipv4Address::new(0, 0, 0, 0)),
+            0,
+        ));
     });
     iface.set_any_ip(true);
 
@@ -71,22 +76,45 @@ pub fn run(
     let mut tcp_flows: HashMap<TcpKey, TcpFlow> = HashMap::new();
     let mut udp_flows: HashMap<UdpKey, UdpFlow> = HashMap::new();
 
-    let stats = Arc::new(Stats::new(bus.clone()));
-    let stats_clone = stats.clone();
-    std::thread::spawn(move || stats_clone.report_loop());
+    let stats = Stats::new(bus.clone());
+    let started = Instant::now();
+    let mut last_report = started;
+    let mut previous_stats = [0; 7];
 
     let mut buffer = vec![0u8; 65535];
     let mut last_vpn = vpn_state::current(&vpn_state);
+    let mut last_revalidate = Instant::now();
 
-    loop {
+    while !shutdown.is_stopped() {
         let now_vpn = vpn_state::current(&vpn_state);
         if now_vpn != last_vpn {
-            on_vpn_change(last_vpn, now_vpn, &mut tcp_flows, &mut udp_flows, &mut sockets, &stats);
+            on_vpn_change(
+                last_vpn,
+                now_vpn,
+                &mut tcp_flows,
+                &mut udp_flows,
+                &mut sockets,
+                &stats,
+            );
             last_vpn = now_vpn;
         }
 
-        let recv_result = capture.recv_wait(&mut buffer, 50);
-        if let Ok(Some(packet)) = recv_result {
+        if last_revalidate.elapsed() >= FLOW_REVALIDATE_INTERVAL {
+            revoke_invalid_flows(
+                &resolver,
+                &tunneled_paths,
+                &mut tcp_flows,
+                &mut udp_flows,
+                &mut sockets,
+                &stats,
+            );
+            last_revalidate = Instant::now();
+        }
+
+        if let Some(packet) = capture
+            .recv_wait(&mut buffer, 50)
+            .context("WinDivert capture receive failed")?
+        {
             handle_capture(
                 packet,
                 &capture,
@@ -113,7 +141,12 @@ pub fn run(
 
         let _ = iface.poll(smoltcp::time::Instant::now(), &mut device, &mut sockets);
         drain_tx(&mut device, &inject, &stats);
+        if last_report.elapsed() >= STATS_INTERVAL {
+            stats.report_delta(&mut previous_stats, started);
+            last_report = Instant::now();
+        }
     }
+    Ok(())
 }
 
 fn on_vpn_change(
@@ -124,21 +157,23 @@ fn on_vpn_change(
     sockets: &mut SocketSet<'static>,
     stats: &Stats,
 ) {
-    if prev.is_some() && now.is_none() {
+    if prev.is_some() && prev != now {
         let tcp_n = tcp_flows.len();
         let udp_n = udp_flows.len();
         if tcp_n + udp_n > 0 {
             tracing::warn!(
-                "VPN down — closing {} TCP + {} UDP tunneled flows",
-                tcp_n, udp_n
+                "VPN target changed — closing {} TCP + {} UDP tunneled flows",
+                tcp_n,
+                udp_n
             );
         }
         for (_, flow) in tcp_flows.drain() {
             sockets.remove(flow.handle);
-            stats.bridges_closed.fetch_add(1, Ordering::Relaxed);
+            if flow.task.is_some() {
+                stats.bridges_closed.fetch_add(1, Ordering::Relaxed);
+            }
         }
-        // dropping the UdpFlow values closes the channels, which causes the
-        // bridge tasks to exit on the next recv attempt.
+        // BridgeTask aborts the worker, including a pending socket recv/send.
         let dropped = udp_flows.drain().count() as u64;
         stats.bridges_closed.fetch_add(dropped, Ordering::Relaxed);
     }
@@ -161,27 +196,195 @@ struct UdpKey {
 struct TcpFlow {
     handle: SocketHandle,
     pid: u32,
+    creation_time: u64,
     original_dst: SocketAddr,
     state: TcpState,
+    task: Option<BridgeTask>,
 }
 
 enum TcpState {
-    Pending,
+    Pending {
+        since: Instant,
+    },
     Bridging {
-        app_to_remote: mpsc::Sender<Vec<u8>>,
+        app_to_remote: Option<mpsc::Sender<Vec<u8>>>,
         remote_to_app: mpsc::Receiver<Vec<u8>>,
-        app_half_closed: bool,
+        pending_remote: Option<PendingWrite>,
     },
     Closed,
 }
 
 struct UdpFlow {
     pid: u32,
+    creation_time: u64,
     app_endpoint: (Ipv4Addr, u16),
     original_dst: (Ipv4Addr, u16),
     app_to_remote: mpsc::Sender<Vec<u8>>,
     remote_to_app: mpsc::Receiver<Vec<u8>>,
     last_active: Instant,
+    _task: BridgeTask,
+}
+
+/// A flow owns its worker. Removing the flow must also cancel pending network
+/// I/O; dropping a bare JoinHandle would leave the task and socket running.
+struct BridgeTask(tokio::task::JoinHandle<()>);
+
+impl Drop for BridgeTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+struct PendingWrite {
+    data: Vec<u8>,
+    written: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TcpAdmission {
+    Tunnel,
+    PassThrough,
+    Drop,
+}
+
+struct TcpRequest {
+    key: TcpKey,
+    pid: u32,
+    creation_time: u64,
+    destination: SocketAddrV4,
+    initial_syn: bool,
+}
+
+fn ensure_tcp_flow(
+    flows: &mut HashMap<TcpKey, TcpFlow>,
+    sockets: &mut SocketSet<'static>,
+    request: TcpRequest,
+    limit: usize,
+) -> TcpAdmission {
+    let is_new = !flows.contains_key(&request.key);
+    if is_new && !request.initial_syn {
+        // An already-running direct connection cannot be adopted by the TCP
+        // proxy midstream. Let it finish on its original route; new SYNs follow
+        // the configured policy. Do not create orphan listeners for its ACKs.
+        return TcpAdmission::PassThrough;
+    }
+    if is_new && flows.len() >= limit {
+        return TcpAdmission::Drop;
+    }
+    if let Entry::Vacant(entry) = flows.entry(request.key) {
+        let rx_buf = tcp::SocketBuffer::new(vec![0u8; 65536]);
+        let tx_buf = tcp::SocketBuffer::new(vec![0u8; 65536]);
+        let mut sock = tcp::Socket::new(rx_buf, tx_buf);
+        let endpoint = IpEndpoint::new(
+            IpAddress::Ipv4(*request.destination.ip()),
+            request.destination.port(),
+        );
+        if let Err(error) = sock.listen(endpoint) {
+            tracing::warn!("smoltcp tcp::listen({}) failed: {:?}", endpoint, error);
+            return TcpAdmission::Drop;
+        }
+        entry.insert(TcpFlow {
+            handle: sockets.add(sock),
+            pid: request.pid,
+            creation_time: request.creation_time,
+            original_dst: SocketAddr::V4(request.destination),
+            state: TcpState::Pending {
+                since: Instant::now(),
+            },
+            task: None,
+        });
+    }
+    TcpAdmission::Tunnel
+}
+
+struct UdpRequest {
+    key: UdpKey,
+    pid: u32,
+    creation_time: u64,
+    target: Option<VpnTarget>,
+}
+
+fn ensure_udp_flow<'a>(
+    flows: &'a mut HashMap<UdpKey, UdpFlow>,
+    request: UdpRequest,
+    tokio_handle: &tokio::runtime::Handle,
+    stats: &Stats,
+    limit: usize,
+) -> Option<&'a mut UdpFlow> {
+    if flows.len() >= limit && !flows.contains_key(&request.key) {
+        return None;
+    }
+    Some(match flows.entry(request.key) {
+        Entry::Occupied(entry) => entry.into_mut(),
+        Entry::Vacant(entry) => {
+            let (a2r_tx, a2r_rx) = mpsc::channel(BRIDGE_CHANNEL_DEPTH);
+            let (r2a_tx, r2a_rx) = mpsc::channel(BRIDGE_CHANNEL_DEPTH);
+            let key = request.key;
+            let dst = SocketAddr::V4(SocketAddrV4::new(key.dst_ip, key.dst_port));
+            tracing::info!(
+                "udp bridge open: pid={} {}:{} -> {}",
+                request.pid,
+                key.src_ip,
+                key.src_port,
+                dst,
+            );
+            let task = BridgeTask(tokio_handle.spawn(async move {
+                if let Err(error) = udp_bridge(dst, request.target, a2r_rx, r2a_tx).await {
+                    tracing::warn!("udp bridge to {} failed: {:#}", dst, error);
+                }
+            }));
+            stats.bridges_opened.fetch_add(1, Ordering::Relaxed);
+            entry.insert(UdpFlow {
+                pid: request.pid,
+                creation_time: request.creation_time,
+                app_endpoint: (key.src_ip, key.src_port),
+                original_dst: (key.dst_ip, key.dst_port),
+                app_to_remote: a2r_tx,
+                remote_to_app: r2a_rx,
+                last_active: Instant::now(),
+                _task: task,
+            })
+        }
+    })
+}
+
+fn revoke_invalid_flows(
+    resolver: &Resolver,
+    tunneled_paths: &TunneledPaths,
+    tcp_flows: &mut HashMap<TcpKey, TcpFlow>,
+    udp_flows: &mut HashMap<UdpKey, UdpFlow>,
+    sockets: &mut SocketSet<'static>,
+    stats: &Stats,
+) {
+    // Resolve each process once per sweep, even if it owns many connections.
+    let mut generations = HashMap::new();
+    let mut allowed = |pid, creation_time| {
+        *generations.entry(pid).or_insert_with(|| {
+            resolver
+                .resolve(pid)
+                .filter(|info| {
+                    tunneled::matches(tunneled_paths, std::path::Path::new(&info.exe_path))
+                })
+                .map(|info| info.creation_time)
+        }) == Some(creation_time)
+    };
+    tcp_flows.retain(|_, flow| {
+        if allowed(flow.pid, flow.creation_time) {
+            return true;
+        }
+        sockets.remove(flow.handle);
+        if flow.task.is_some() {
+            stats.bridges_closed.fetch_add(1, Ordering::Relaxed);
+        }
+        false
+    });
+    udp_flows.retain(|_, flow| {
+        if allowed(flow.pid, flow.creation_time) {
+            return true;
+        }
+        stats.bridges_closed.fetch_add(1, Ordering::Relaxed);
+        false
+    });
 }
 
 /// Resolve the owning PID for a freshly-seen flow. The fast path is the
@@ -242,60 +445,82 @@ fn handle_capture(
         }
     };
 
-    let (src_ip, src_port, dst_ip, dst_port, is_tcp) = match parsed {
-        ParsedL4::Tcp { src_ip, src_port, dst_ip, dst_port, .. } => {
-            (src_ip, src_port, dst_ip, dst_port, true)
-        }
-        ParsedL4::Udp { src_ip, src_port, dst_ip, dst_port, .. } => {
-            (src_ip, src_port, dst_ip, dst_port, false)
-        }
+    let (src_ip, src_port, dst_ip, dst_port, is_tcp, initial_syn) = match parsed {
+        ParsedL4::Tcp {
+            src_ip,
+            src_port,
+            dst_ip,
+            dst_port,
+            initial_syn,
+        } => (src_ip, src_port, dst_ip, dst_port, true, initial_syn),
+        ParsedL4::Udp {
+            src_ip,
+            src_port,
+            dst_ip,
+            dst_port,
+            ..
+        } => (src_ip, src_port, dst_ip, dst_port, false, false),
     };
 
     let proto = if is_tcp { PROTO_TCP } else { PROTO_UDP };
     let pid = resolve_pid_with_retry(flows, src_ip, src_port, proto);
-    if let Some(p) = pid {
-        flows::insert(
-            flows,
-            LocalEndpoint { addr: IpAddr::V4(src_ip), port: src_port, proto },
-            FlowEntry { pid: p },
-        );
-    }
-
-    // Three-step admission:
-    //   1. PID already in policy → tunnel
-    //   2. PID has a known exe path matching the tunnel list → admit now
-    //      (this is the path that closes the proc_watcher race — fast
-    //      launchers like STOVE make their first connection before any
-    //      polling tick would catch them)
-    //   3. otherwise → pass through to the default route
-    let is_tunneled = match pid {
-        Some(p) if policy::contains(policy_state, p) => true,
-        Some(p) => {
-            if let Some(info) = resolver.resolve(p) {
-                if tunneled::matches(tunneled_paths, std::path::Path::new(&info.exe_path)) {
-                    tracing::info!(
-                        "auto-tunnel (packet): pid={} matches {}",
-                        p, info.exe_path
-                    );
-                    policy::add(policy_state, p);
-                    bus.pid_paths.insert(p, info.exe_path);
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
+    // A policy PID is a display/cache hint, never authority across PID reuse or
+    // a path-list edit. Revalidate the current process identity on admission.
+    // Packet-derived aliases are deliberately not inserted into the SOCKET
+    // event table: their lifetime cannot be paired reliably with CLOSE events.
+    let admitted = pid.and_then(|p| {
+        resolver
+            .resolve(p)
+            .filter(|info| tunneled::matches(tunneled_paths, std::path::Path::new(&info.exe_path)))
+            .map(|info| (p, info))
+    });
+    let identity = admitted.as_ref().map(|(p, info)| (*p, info.creation_time));
+    if is_tcp {
+        let key = TcpKey { src_ip, src_port };
+        if tcp_flows
+            .get(&key)
+            .is_some_and(|flow| Some((flow.pid, flow.creation_time)) != identity)
+        {
+            let flow = tcp_flows.remove(&key).unwrap();
+            sockets.remove(flow.handle);
+            if flow.task.is_some() {
+                stats.bridges_closed.fetch_add(1, Ordering::Relaxed);
             }
         }
-        None => false,
-    };
-
-    if !is_tunneled {
+    } else {
+        let key = UdpKey {
+            src_ip,
+            src_port,
+            dst_ip,
+            dst_port,
+        };
+        if udp_flows
+            .get(&key)
+            .is_some_and(|flow| Some((flow.pid, flow.creation_time)) != identity)
+        {
+            udp_flows.remove(&key);
+            stats.bridges_closed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let Some((pid, info)) = admitted else {
+        if let Some(p) = pid {
+            policy::remove(policy_state, p);
+            bus.pid_paths.remove(&p);
+        }
         let _ = capture.send(&packet);
         stats.passed.fetch_add(1, Ordering::Relaxed);
         return;
+    };
+    if !policy::contains(policy_state, pid) {
+        tracing::info!(
+            "auto-tunnel (packet): pid={} matches {}",
+            pid,
+            info.exe_path
+        );
+        policy::add(policy_state, pid);
+        bus.pid_paths.insert(pid, info.exe_path);
     }
-    let pid = pid.unwrap();
+    let creation_time = info.creation_time;
 
     // Fail-open: if the VPN is down, send the packet out the default route
     // instead of dropping it. This trades the "no clear-text leak when VPN
@@ -311,31 +536,42 @@ fn handle_capture(
     }
 
     if is_tcp {
-        let key = TcpKey { src_ip, src_port };
-        if !tcp_flows.contains_key(&key) {
-            let rx_buf = tcp::SocketBuffer::new(vec![0u8; 65536]);
-            let tx_buf = tcp::SocketBuffer::new(vec![0u8; 65536]);
-            let mut sock = tcp::Socket::new(rx_buf, tx_buf);
-            let endpoint = IpEndpoint::new(IpAddress::Ipv4(dst_ip.into()), dst_port);
-            if let Err(e) = sock.listen(endpoint) {
-                tracing::warn!("smoltcp tcp::listen({}) failed: {:?}", endpoint, e);
+        let request = TcpRequest {
+            key: TcpKey { src_ip, src_port },
+            pid,
+            creation_time,
+            destination: SocketAddrV4::new(dst_ip, dst_port),
+            initial_syn,
+        };
+        match ensure_tcp_flow(tcp_flows, sockets, request, MAX_TCP_FLOWS) {
+            TcpAdmission::Tunnel => device.push_rx(packet.data.into_owned()),
+            TcpAdmission::PassThrough => {
+                let _ = capture.send(&packet);
+                stats.passed.fetch_add(1, Ordering::Relaxed);
                 return;
             }
-            let handle = sockets.add(sock);
-            tcp_flows.insert(
-                key,
-                TcpFlow {
-                    handle,
-                    pid,
-                    original_dst: SocketAddr::V4(SocketAddrV4::new(dst_ip, dst_port)),
-                    state: TcpState::Pending,
-                },
-            );
+            TcpAdmission::Drop => {}
         }
-        device.push_rx(packet.data.into_owned());
         stats.captured.fetch_add(1, Ordering::Relaxed);
     } else {
-        let key = UdpKey { src_ip, src_port, dst_ip, dst_port };
+        let request = UdpRequest {
+            key: UdpKey {
+                src_ip,
+                src_port,
+                dst_ip,
+                dst_port,
+            },
+            pid,
+            creation_time,
+            target: vpn_target,
+        };
+        let Some(flow) = ensure_udp_flow(udp_flows, request, tokio_handle, stats, MAX_UDP_FLOWS)
+        else {
+            // Reject excess new flows before allocating channels, workers or
+            // payload buffers. Existing flows are allowed to drain at the cap.
+            stats.captured.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
         let payload = match extract_udp_payload(&packet.data) {
             Some(p) => p,
             None => {
@@ -344,43 +580,11 @@ fn handle_capture(
             }
         };
 
-        if !udp_flows.contains_key(&key) {
-            let (a2r_tx, a2r_rx) = mpsc::channel::<Vec<u8>>(BRIDGE_CHANNEL_DEPTH);
-            let (r2a_tx, r2a_rx) = mpsc::channel::<Vec<u8>>(BRIDGE_CHANNEL_DEPTH);
-
-            tracing::info!(
-                "udp bridge open: pid={} {}:{} -> {}:{}",
-                pid, src_ip, src_port, dst_ip, dst_port
-            );
-
-            let dst = SocketAddr::V4(SocketAddrV4::new(dst_ip, dst_port));
-            tokio_handle.spawn(async move {
-                if let Err(e) = udp_bridge(dst, vpn_target, a2r_rx, r2a_tx).await {
-                    tracing::warn!("udp bridge to {} failed: {:#}", dst, e);
-                }
-            });
-            stats.bridges_opened.fetch_add(1, Ordering::Relaxed);
-
-            udp_flows.insert(
-                key,
-                UdpFlow {
-                    pid,
-                    app_endpoint: (src_ip, src_port),
-                    original_dst: (dst_ip, dst_port),
-                    app_to_remote: a2r_tx,
-                    remote_to_app: r2a_rx,
-                    last_active: Instant::now(),
-                },
-            );
-        }
-
-        if let Some(flow) = udp_flows.get_mut(&key) {
-            flow.last_active = Instant::now();
-            let len = packet.data.len() as u64;
-            if flow.app_to_remote.try_send(payload).is_ok() {
-                stats.add_app_to_remote(len);
-                stats.add_pid_out(flow.pid, len);
-            }
+        flow.last_active = Instant::now();
+        let len = packet.data.len() as u64;
+        if flow.app_to_remote.try_send(payload).is_ok() {
+            stats.add_app_to_remote(len);
+            stats.add_pid_out(flow.pid, len);
         }
         stats.captured.fetch_add(1, Ordering::Relaxed);
         // packet consumed - do NOT reinject
@@ -424,36 +628,53 @@ fn service_tcp_flows(
     let mut to_remove = Vec::new();
     for (key, flow) in tcp_flows.iter_mut() {
         match &mut flow.state {
-            TcpState::Pending => {
+            TcpState::Pending { since } => {
                 let socket = sockets.get_mut::<tcp::Socket>(flow.handle);
-                if socket.state() == tcp::State::Established {
+                // The first post-handshake packet can contain FIN as well as
+                // data, so CloseWait still needs a bridge to drain the request.
+                if matches!(
+                    socket.state(),
+                    tcp::State::Established | tcp::State::CloseWait
+                ) {
                     let (a2r_tx, a2r_rx) = mpsc::channel::<Vec<u8>>(BRIDGE_CHANNEL_DEPTH);
                     let (r2a_tx, r2a_rx) = mpsc::channel::<Vec<u8>>(BRIDGE_CHANNEL_DEPTH);
 
                     tracing::info!(
                         "tcp bridge open: pid={} {}:{} -> {}",
-                        flow.pid, key.src_ip, key.src_port, flow.original_dst
+                        flow.pid,
+                        key.src_ip,
+                        key.src_port,
+                        flow.original_dst
                     );
 
                     let dst = flow.original_dst;
-                    tokio_handle.spawn(async move {
+                    flow.task = Some(BridgeTask(tokio_handle.spawn(async move {
                         if let Err(e) = tcp_bridge(dst, vpn_target, a2r_rx, r2a_tx).await {
                             tracing::warn!("tcp bridge to {} failed: {:#}", dst, e);
                         }
-                    });
+                    })));
                     stats.bridges_opened.fetch_add(1, Ordering::Relaxed);
 
                     flow.state = TcpState::Bridging {
-                        app_to_remote: a2r_tx,
+                        app_to_remote: Some(a2r_tx),
                         remote_to_app: r2a_rx,
-                        app_half_closed: false,
+                        pending_remote: None,
                     };
+                } else if !socket.is_open() || since.elapsed() >= TCP_HANDSHAKE_TIMEOUT {
+                    // Keep the aborted socket until the next poll has had a
+                    // chance to emit RST, then remove its buffers next turn.
+                    socket.abort();
+                    flow.state = TcpState::Closed;
                 }
             }
-            TcpState::Bridging { app_to_remote, remote_to_app, app_half_closed } => {
+            TcpState::Bridging {
+                app_to_remote,
+                remote_to_app,
+                pending_remote,
+            } => {
                 let socket = sockets.get_mut::<tcp::Socket>(flow.handle);
-                pump_tcp_app_to_remote(socket, app_to_remote, app_half_closed, flow.pid, stats);
-                pump_tcp_remote_to_app(socket, remote_to_app, flow.pid, stats);
+                pump_tcp_app_to_remote(socket, app_to_remote, flow.pid, stats);
+                pump_tcp_remote_to_app(socket, remote_to_app, pending_remote, flow.pid, stats);
                 if matches!(socket.state(), tcp::State::Closed | tcp::State::TimeWait) {
                     flow.state = TcpState::Closed;
                 }
@@ -464,7 +685,9 @@ fn service_tcp_flows(
     for k in to_remove {
         if let Some(flow) = tcp_flows.remove(&k) {
             sockets.remove(flow.handle);
-            stats.bridges_closed.fetch_add(1, Ordering::Relaxed);
+            if flow.task.is_some() {
+                stats.bridges_closed.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -514,12 +737,23 @@ fn service_udp_flows(
 
 fn pump_tcp_app_to_remote(
     socket: &mut tcp::Socket,
-    sender: &mpsc::Sender<Vec<u8>>,
-    app_half_closed: &mut bool,
+    sender: &mut Option<mpsc::Sender<Vec<u8>>>,
     pid: u32,
     stats: &Stats,
 ) {
+    let Some(tx) = sender.as_ref() else { return };
     while socket.can_recv() {
+        // Reserve capacity before dequeuing acknowledged TCP bytes. On a full
+        // bridge queue, leave them in smoltcp so its receive window applies
+        // backpressure to the application.
+        let permit = match tx.try_reserve() {
+            Ok(permit) => permit,
+            Err(mpsc::error::TrySendError::Full(_)) => break,
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                socket.abort();
+                return;
+            }
+        };
         let mut buf = vec![0u8; SMOLTCP_CHUNK];
         let n = match socket.recv_slice(&mut buf) {
             Ok(n) => n,
@@ -529,49 +763,53 @@ fn pump_tcp_app_to_remote(
             break;
         }
         buf.truncate(n);
-        match sender.try_send(buf) {
-            Ok(()) => {
-                stats.add_app_to_remote(n as u64);
-                stats.add_pid_out(pid, n as u64);
-            }
-            Err(_) => break,
-        }
+        permit.send(buf);
+        stats.add_app_to_remote(n as u64);
+        stats.add_pid_out(pid, n as u64);
     }
-    if !*app_half_closed && matches!(
-        socket.state(),
-        tcp::State::CloseWait | tcp::State::LastAck | tcp::State::Closing
-    ) {
-        *app_half_closed = true;
+    if !socket.may_recv() {
+        // may_recv stays true until every buffered byte preceding FIN has
+        // been drained. Closing this sender then delivers EOF after the queued
+        // chunks, and the bridge shuts down only the remote write half.
+        sender.take();
     }
 }
 
 fn pump_tcp_remote_to_app(
     socket: &mut tcp::Socket,
     receiver: &mut mpsc::Receiver<Vec<u8>>,
+    pending: &mut Option<PendingWrite>,
     pid: u32,
     stats: &Stats,
 ) {
-    while socket.can_send() {
-        match receiver.try_recv() {
-            Ok(data) => {
-                let mut written = 0;
-                while written < data.len() {
-                    match socket.send_slice(&data[written..]) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            written += n;
-                            stats.add_remote_to_app(n as u64);
-                            stats.add_pid_in(pid, n as u64);
-                        }
-                        Err(_) => return,
-                    }
+    loop {
+        if pending.is_none() {
+            match receiver.try_recv() {
+                Ok(data) => *pending = Some(PendingWrite { data, written: 0 }),
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    // close() queues FIN after bytes already in the TX buffer.
+                    socket.close();
+                    break;
                 }
             }
-            Err(mpsc::error::TryRecvError::Empty) => break,
-            Err(mpsc::error::TryRecvError::Disconnected) => {
-                socket.close();
-                break;
+        }
+        let data = pending.as_mut().unwrap();
+        if data.written == data.data.len() {
+            *pending = None;
+            continue;
+        }
+        if !socket.can_send() {
+            break;
+        }
+        match socket.send_slice(&data.data[data.written..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                data.written += n;
+                stats.add_remote_to_app(n as u64);
+                stats.add_pid_in(pid, n as u64);
             }
+            Err(_) => break,
         }
     }
 }
@@ -581,7 +819,10 @@ fn pump_tcp_remote_to_app(
 /// `--pull-filter ignore redirect-gateway` on the OpenVPN side, this is what
 /// turns the tunnel into a true split-tunnel — only sockets we explicitly pin
 /// land on the VPN, everything else stays on the default route.
-fn set_unicast_if_v4<S: std::os::windows::io::AsRawSocket>(socket: &S, if_index: u32) -> Result<()> {
+fn set_unicast_if_v4<S: std::os::windows::io::AsRawSocket>(
+    socket: &S,
+    if_index: u32,
+) -> Result<()> {
     use windows::Win32::Networking::WinSock::{setsockopt, IPPROTO_IP, SOCKET};
 
     // IP_UNICAST_IF wants the index in network byte order.
@@ -622,34 +863,34 @@ async fn tcp_bridge(
             .await
             .with_context(|| format!("tcp connect({})", dst))?,
     };
-    tracing::debug!("tcp bridge connected to {} (local={:?})", dst, stream.local_addr().ok());
+    tracing::debug!(
+        "tcp bridge connected to {} (local={:?})",
+        dst,
+        stream.local_addr().ok()
+    );
     let (mut rd, mut wr) = stream.into_split();
 
-    let write_task = tokio::spawn(async move {
+    let write = async move {
         while let Some(data) = from_app.recv().await {
-            if wr.write_all(&data).await.is_err() {
-                break;
-            }
+            wr.write_all(&data).await?;
         }
-        let _ = wr.shutdown().await;
-    });
+        wr.shutdown().await
+    };
 
-    let read_task = tokio::spawn(async move {
+    let read = async move {
         let mut buf = vec![0u8; SMOLTCP_CHUNK];
         loop {
-            match rd.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    if to_app.send(buf[..n].to_vec()).await.is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
+            let n = rd.read(&mut buf).await?;
+            if n == 0 || to_app.send(buf[..n].to_vec()).await.is_err() {
+                return Ok::<(), std::io::Error>(());
             }
         }
-    });
+    };
 
-    let _ = tokio::join!(write_task, read_task);
+    // These are child futures, not detached tasks. A transport error cancels
+    // its peer, while a normal half-close lets the opposite direction finish.
+    // Aborting the owning BridgeTask drops both halves, even during pending I/O.
+    tokio::try_join!(write, read)?;
     Ok(())
 }
 
@@ -669,37 +910,40 @@ async fn udp_bridge(
     if let Some(t) = target {
         set_unicast_if_v4(&socket, t.if_index)?;
     }
-    socket.connect(dst).await
+    socket
+        .connect(dst)
+        .await
         .with_context(|| format!("udp connect({})", dst))?;
-    tracing::debug!("udp bridge {} -> {} (local={:?})", local, dst, socket.local_addr().ok());
-    let sock = Arc::new(socket);
-
-    let send_sock = sock.clone();
-    let send_task = tokio::spawn(async move {
+    tracing::debug!(
+        "udp bridge {} -> {} (local={:?})",
+        local,
+        dst,
+        socket.local_addr().ok()
+    );
+    let send = async {
         while let Some(data) = from_app.recv().await {
-            if send_sock.send(&data).await.is_err() {
-                break;
-            }
+            socket.send(&data).await?;
         }
-    });
+        Ok::<(), std::io::Error>(())
+    };
 
-    let recv_sock = sock;
-    let recv_task = tokio::spawn(async move {
+    let recv = async {
         let mut buf = vec![0u8; 65536];
         loop {
-            match recv_sock.recv(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    if to_app.send(buf[..n].to_vec()).await.is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
+            let n = socket.recv(&mut buf).await?;
+            // A zero-byte UDP datagram is data, not the EOF used by TCP.
+            if to_app.send(buf[..n].to_vec()).await.is_err() {
+                return Ok::<(), std::io::Error>(());
             }
         }
-    });
+    };
 
-    let _ = tokio::join!(send_task, recv_task);
+    // Finishing either direction closes the UDP flow. Cancelling the other
+    // future also releases the sole socket, including an idle pending recv.
+    tokio::select! {
+        result = send => result?,
+        result = recv => result?,
+    }
     Ok(())
 }
 
@@ -709,6 +953,7 @@ enum ParsedL4 {
         src_port: u16,
         dst_ip: Ipv4Addr,
         dst_port: u16,
+        initial_syn: bool,
     },
     Udp {
         src_ip: Ipv4Addr,
@@ -733,6 +978,7 @@ fn parse_ipv4_l4(data: &[u8]) -> Option<ParsedL4> {
             src_port: tcp.source_port(),
             dst_ip,
             dst_port: tcp.destination_port(),
+            initial_syn: tcp.syn() && !tcp.ack() && !tcp.rst() && !tcp.fin(),
         }),
         TransportSlice::Udp(udp_slice) => Some(ParsedL4::Udp {
             src_ip,
@@ -819,26 +1065,32 @@ impl Stats {
         self.bus.add_pid_in(pid, n);
     }
 
-    fn report_loop(&self) {
-        let start = Instant::now();
-        let mut last = [0u64; 7];
-        loop {
-            std::thread::sleep(Duration::from_secs(5));
-            let cur = [
-                self.passed.load(Ordering::Relaxed),
-                self.captured.load(Ordering::Relaxed),
-                self.injected.load(Ordering::Relaxed),
-                self.bridges_opened.load(Ordering::Relaxed),
-                self.bridges_closed.load(Ordering::Relaxed),
-                self.bus.bytes_out.load(Ordering::Relaxed),
-                self.bus.bytes_in.load(Ordering::Relaxed),
-            ];
-            let d: Vec<u64> = cur.iter().zip(&last).map(|(a, b)| a - b).collect();
-            last = cur;
-            tracing::info!(
-                "divert 5s: pass={} cap={} inj={} bridges +{}/-{} a→r={}B r→a={}B (uptime {:?})",
-                d[0], d[1], d[2], d[3], d[4], d[5], d[6], start.elapsed()
-            );
-        }
+    fn report_delta(&self, last: &mut [u64; 7], started: Instant) {
+        let cur = [
+            self.passed.load(Ordering::Relaxed),
+            self.captured.load(Ordering::Relaxed),
+            self.injected.load(Ordering::Relaxed),
+            self.bridges_opened.load(Ordering::Relaxed),
+            self.bridges_closed.load(Ordering::Relaxed),
+            self.bus.bytes_out.load(Ordering::Relaxed),
+            self.bus.bytes_in.load(Ordering::Relaxed),
+        ];
+        let delta: [u64; 7] = std::array::from_fn(|i| cur[i].saturating_sub(last[i]));
+        *last = cur;
+        tracing::info!(
+            "divert 5s: pass={} cap={} inj={} bridges +{}/-{} a→r={}B r→a={}B (uptime {:?})",
+            delta[0],
+            delta[1],
+            delta[2],
+            delta[3],
+            delta[4],
+            delta[5],
+            delta[6],
+            started.elapsed()
+        );
     }
 }
+
+#[cfg(test)]
+#[path = "divert_tests.rs"]
+mod tests;

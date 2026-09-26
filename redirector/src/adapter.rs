@@ -3,10 +3,12 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use anyhow::{bail, Result};
 use windows::Win32::Foundation::ERROR_BUFFER_OVERFLOW;
 use windows::Win32::NetworkManagement::IpHelper::{
-    GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
-    GAA_FLAG_SKIP_MULTICAST, IP_ADAPTER_ADDRESSES_LH,
+    GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST,
+    IP_ADAPTER_ADDRESSES_LH,
 };
-use windows::Win32::Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6};
+use windows::Win32::Networking::WinSock::{
+    AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6,
+};
 
 #[derive(Debug, Clone)]
 pub struct Adapter {
@@ -40,9 +42,7 @@ impl Adapter {
 
     pub fn routable_ipv4(&self) -> Option<std::net::Ipv4Addr> {
         self.addresses.iter().find_map(|ip| match ip {
-            IpAddr::V4(v4)
-                if !v4.is_link_local() && !v4.is_unspecified() && !v4.is_loopback() =>
-            {
+            IpAddr::V4(v4) if !v4.is_link_local() && !v4.is_unspecified() && !v4.is_loopback() => {
                 Some(*v4)
             }
             _ => None,
@@ -55,15 +55,21 @@ pub fn find_vpn_target(adapters: &[Adapter]) -> Option<VpnTarget> {
     // session reads as "VPN up" even after openvpn has exited — the redirector
     // would then keep tunneling flows to a dead interface and report a
     // bogus uptime to the UI.
-    for a in adapters.iter().filter(|a| a.is_vpn_candidate() && a.is_up) {
-        if let Some(ip) = a.routable_ipv4() {
-            return Some(VpnTarget {
-                ipv4: ip,
+    let mut targets = adapters
+        .iter()
+        .filter(|a| a.is_vpn_candidate() && a.is_up)
+        .filter_map(|a| {
+            a.routable_ipv4().map(|ipv4| VpnTarget {
+                ipv4,
                 if_index: a.if_index,
-            });
-        }
+            })
+        });
+    let target = targets.next()?;
+    if targets.next().is_some() {
+        tracing::warn!("multiple active VPN adapters; cannot safely select a target");
+        return None;
     }
-    None
+    Some(target)
 }
 
 pub fn enumerate() -> Result<Vec<Adapter>> {

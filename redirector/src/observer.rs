@@ -8,7 +8,12 @@ use crate::flows::{self, FlowEntry, FlowTable, LocalEndpoint};
 use crate::policy::{self, PolicyState};
 use crate::process::Resolver;
 
-pub fn run(resolver: Arc<Resolver>, policy_state: PolicyState, flows: FlowTable) -> Result<()> {
+pub fn run(
+    resolver: Arc<Resolver>,
+    policy_state: PolicyState,
+    flows: FlowTable,
+    shutdown: crate::shutdown::Shutdown,
+) -> Result<()> {
     let filter = "event = CONNECT or event = ACCEPT or event = BIND or event = CLOSE";
     let flags = WinDivertFlags::new().set_sniff().set_recv_only();
     let handle = WinDivert::socket(filter, 0, flags).context(
@@ -17,16 +22,16 @@ pub fn run(resolver: Arc<Resolver>, policy_state: PolicyState, flows: FlowTable)
 
     tracing::info!("SOCKET observer started, filter: {}", filter);
     println!(
-        "\n{:<3} {:<8} {:<6} {:<5} {:<46} {:<46} {}",
-        "TUN", "EVENT", "PID", "PROTO", "LOCAL", "REMOTE", "PROCESS"
+        "\n{:<3} {:<8} {:<6} {:<5} {:<46} {:<46} PROCESS",
+        "TUN", "EVENT", "PID", "PROTO", "LOCAL", "REMOTE"
     );
     println!("{}", "-".repeat(150));
 
-    loop {
-        match handle.recv() {
-            Ok(packet) => handle_event(&packet.address, &resolver, &policy_state, &flows),
-            Err(WinDivertError::Recv(WinDivertRecvError::NoData)) => break,
-            Err(e) => tracing::warn!("recv error: {}", e),
+    while !shutdown.is_stopped() {
+        match handle.recv_wait(100) {
+            Ok(Some(packet)) => handle_event(&packet.address, &resolver, &policy_state, &flows),
+            Ok(None) => continue,
+            Err(e) => return Err(e).context("SOCKET observer receive failed"),
         }
     }
     Ok(())
@@ -46,12 +51,15 @@ fn handle_event(
 
     match event {
         WinDivertEvent::SocketBind | WinDivertEvent::SocketConnect => {
-            let key = LocalEndpoint { addr: local_addr, port: local_port, proto };
-            flows::insert(flows, key, FlowEntry { pid });
+            let key = LocalEndpoint {
+                addr: local_addr,
+                port: local_port,
+                proto,
+            };
+            flows::insert_socket(flows, key, FlowEntry { pid }, addr.endpoint_id());
         }
         WinDivertEvent::SocketClose => {
-            let key = LocalEndpoint { addr: local_addr, port: local_port, proto };
-            flows::remove(flows, &key);
+            flows::close_socket(flows, addr.endpoint_id());
         }
         _ => {}
     }
@@ -85,7 +93,11 @@ fn log_event(
         .map(|p| p.exe_name)
         .unwrap_or_else(|| "?".into());
 
-    let marker = if policy::contains(policy_state, pid) { "VPN" } else { "" };
+    let marker = if policy::contains(policy_state, pid) {
+        "VPN"
+    } else {
+        ""
+    };
 
     println!(
         "{:<3} {:<8} {:<6} {:<5} {:<46} {:<46} {}",

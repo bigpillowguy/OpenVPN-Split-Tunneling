@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 
-use smoltcp::phy::{Checksum, ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::phy::{
+    Checksum, ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken,
+};
 use smoltcp::time::Instant;
 
 pub struct VirtualDevice {
@@ -45,7 +47,9 @@ impl Device for VirtualDevice {
         let pkt = self.rx.pop_front()?;
         Some((
             VirtRxToken { data: pkt },
-            VirtTxToken { queue: &mut self.tx },
+            VirtTxToken {
+                queue: &mut self.tx,
+            },
         ))
     }
 
