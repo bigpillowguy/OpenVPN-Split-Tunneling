@@ -21,6 +21,7 @@ internal interface IDnsGuardClient
 internal sealed class ExperimentalDnsController
 {
     private readonly IDnsGuardClient _guard;
+    private readonly IDnsControlClient _control;
     private readonly DnsProcessIdentity _owner;
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly object _sync = new();
@@ -31,6 +32,7 @@ internal sealed class ExperimentalDnsController
     private string _rejectionDetail = "DNS activation was not confirmed. Reconnect to retry.";
     private ExperimentalDnsState _rejectionState = ExperimentalDnsState.RecoveryRequired;
     private Guid? _lease;
+    private bool _acquireIssued;
     private bool _enabled, _paused, _initialized;
     private ExperimentalDnsState _state;
     private string _detail = "Experimental split DNS is off.";
@@ -38,9 +40,10 @@ internal sealed class ExperimentalDnsController
     public string Detail { get { lock (_sync) return _detail; } }
     public event EventHandler? StateChanged;
 
-    public ExperimentalDnsController(IDnsGuardClient guard, DnsProcessIdentity owner, Func<DateTimeOffset>? now = null)
+    public ExperimentalDnsController(IDnsGuardClient guard, DnsProcessIdentity owner, IDnsControlClient control, Func<DateTimeOffset>? now = null)
     {
         _guard = guard;
+        _control = control;
         _owner = owner;
         var origin = DateTimeOffset.UtcNow;
         var started = Stopwatch.GetTimestamp();
@@ -99,11 +102,15 @@ internal sealed class ExperimentalDnsController
         await _gate.WaitAsync().ConfigureAwait(false);
         try
         {
-            if (_lease is not { } lease || State != ExperimentalDnsState.Active || _now() - _inspected < TimeSpan.FromSeconds(3)) return;
-            _inspected = _now();
-            var result = await _guard.InspectAsync().ConfigureAwait(false);
-            if (result.Version != 1 || result.Status != "active" || result.Lease != lease)
-                RejectCurrentLease("The guard no longer confirms this DNS lease. Reconnect after restoration to retry.");
+            if (_lease is { } currentLease && _leaseTarget is { } currentTarget && State == ExperimentalDnsState.Active && !_control.IsArmed(currentLease, currentTarget))
+                RejectCurrentLease("The backend no longer confirms this DNS control lease. Restoring system DNS.");
+            if (_lease is { } lease && State == ExperimentalDnsState.Active && _now() - _inspected >= TimeSpan.FromSeconds(3))
+            {
+                _inspected = _now();
+                var result = await _guard.InspectAsync().ConfigureAwait(false);
+                if (result.Version != 1 || result.Status != "active" || result.Lease != lease)
+                    RejectCurrentLease("The guard no longer confirms this DNS lease. Reconnect after restoration to retry.");
+            }
         }
         catch (Exception) { RejectCurrentLease("The active DNS guard could not be verified. Reconnect after restoration to retry."); }
         finally { _gate.Release(); }
@@ -134,12 +141,7 @@ internal sealed class ExperimentalDnsController
                 if (_lease is { } lease && (target != _leaseTarget || State == ExperimentalDnsState.RecoveryRequired))
                 {
                     SetState(ExperimentalDnsState.Restoring, "Restoring the shared Windows DNS Client service…");
-                    DnsGuardReply restored;
-                    try { restored = await _guard.ReleaseAsync(lease).ConfigureAwait(false); }
-                    catch (Exception) { SetState(ExperimentalDnsState.RecoveryRequired, "The guard has not confirmed DNS restoration. Retry before stopping the backend."); return; }
-                    if (restored.Version != 1 || restored.Status != "off" || (restored.Lease is { } other && other != lease))
-                    { SetState(ExperimentalDnsState.RecoveryRequired, "The guard has not confirmed this lease was restored. " + restored.Reason); return; }
-                    lock (_sync) { _lease = null; _leaseTarget = null; }
+                    if (!await RestoreLeaseAsync(lease).ConfigureAwait(false)) return;
                     continue;
                 }
                 if (_lease is not null) return;
@@ -153,17 +155,25 @@ internal sealed class ExperimentalDnsController
                 }
                 if (target == _rejected) { SetState(_rejectionState, _rejectionDetail); return; }
                 var acquiredLease = Guid.NewGuid();
-                lock (_sync) { _lease = acquiredLease; _leaseTarget = target; }
-                SetState(ExperimentalDnsState.Preparing, "Preparing the shared Windows DNS Client service…");
+                lock (_sync) { _lease = acquiredLease; _leaseTarget = target; _acquireIssued = false; }
+                SetState(ExperimentalDnsState.Preparing, "Waiting for the DNS backend to acknowledge this lease…");
                 DnsGuardReply reply;
-                try { reply = await _guard.AcquireAsync(acquiredLease, _owner, target.Backend).ConfigureAwait(false); }
+                try
+                {
+                    await _control.ArmAsync(acquiredLease, target).ConfigureAwait(false);
+                    if (EffectiveTarget() != target) continue;
+                    if (!_control.IsArmed(acquiredLease, target)) throw new InvalidOperationException("DNS control acknowledgement expired.");
+                    SetState(ExperimentalDnsState.Preparing, "Preparing the shared Windows DNS Client service…");
+                    _acquireIssued = true;
+                    reply = await _guard.AcquireAsync(acquiredLease, _owner, target.Backend).ConfigureAwait(false);
+                }
                 catch (Exception)
                 {
                     lock (_sync) { _rejected = target; _rejectionState = ExperimentalDnsState.RecoveryRequired; _rejectionDetail = "DNS activation was not confirmed. Reconnect to retry."; }
                     SetState(ExperimentalDnsState.RecoveryRequired, "DNS activation was not confirmed; restoring the pending lease.");
                     continue;
                 }
-                if (reply.Version == 1 && reply.Status == "active" && reply.Lease == acquiredLease && EffectiveTarget() == target)
+                if (reply.Version == 1 && reply.Status == "active" && reply.Lease == acquiredLease && EffectiveTarget() == target && _control.IsArmed(acquiredLease, target))
                 {
                     _inspected = _now();
                     SetState(ExperimentalDnsState.Active, "Experimental split DNS is active for ordinary IPv4 DNS on port 53. The shared Dnscache service is temporarily replaced; DoH/DoT is not replaced.");
@@ -175,10 +185,7 @@ internal sealed class ExperimentalDnsController
                 _rejectionState = terminal;
                 _rejectionDetail = reply.Status == "unsupported" ? "This Windows configuration does not support the experimental DNS guard. " + reply.Reason : "DNS activation could not be confirmed. " + reply.Reason;
                 SetState(ExperimentalDnsState.RecoveryRequired, "Restoring an unconfirmed or superseded DNS lease.");
-                var cleanup = await _guard.ReleaseAsync(acquiredLease).ConfigureAwait(false);
-                if (cleanup.Version != 1 || cleanup.Status != "off" || (cleanup.Lease is { } returned && returned != acquiredLease))
-                { SetState(ExperimentalDnsState.RecoveryRequired, "DNS restoration needs attention. " + cleanup.Reason); return; }
-                lock (_sync) { _lease = null; _leaseTarget = null; }
+                if (!await RestoreLeaseAsync(acquiredLease).ConfigureAwait(false)) return;
                 if (EffectiveTarget() != target) continue;
                 SetState(terminal, _rejectionDetail);
                 return;
@@ -186,6 +193,30 @@ internal sealed class ExperimentalDnsController
         }
         catch (Exception ex) { SetFailure(ex); }
         finally { _gate.Release(); }
+    }
+
+    private async Task<bool> RestoreLeaseAsync(Guid lease)
+    {
+        try
+        {
+            if (_acquireIssued)
+            {
+                var restored = await _guard.ReleaseAsync(lease).ConfigureAwait(false);
+                if (restored.Version != 1 || restored.Status != "off" || (restored.Lease is { } other && other != lease))
+                { SetState(ExperimentalDnsState.RecoveryRequired, "The guard has not confirmed this lease was restored. " + restored.Reason); return false; }
+                _acquireIssued = false;
+            }
+            // Keep DNS admission armed while service restoration is uncertain.
+            // Failed arm before Acquire needs only data-plane cleanup.
+            if (_leaseTarget is { } target) await _control.DisarmAsync(lease, target).ConfigureAwait(false);
+            lock (_sync) { _lease = null; _leaseTarget = null; }
+            return true;
+        }
+        catch (Exception)
+        {
+            SetState(ExperimentalDnsState.RecoveryRequired, "DNS restoration or backend deactivation is not confirmed. Retry before stopping the backend.");
+            return false;
+        }
     }
 
     private void SetFailure(Exception ex) => SetState(ex is NotSupportedException && _lease is null ? ExperimentalDnsState.Unsupported : ExperimentalDnsState.RecoveryRequired,

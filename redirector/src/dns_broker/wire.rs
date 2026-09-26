@@ -10,6 +10,24 @@ pub struct Question {
     class: u16,
 }
 
+impl Question {
+    pub fn kind(&self) -> u16 {
+        self.kind
+    }
+}
+
+/// Header-only metadata for already validated responses. The low four RCODE
+/// bits are reported explicitly; EDNS extended errors are not mislabelled here.
+pub fn response_header(bytes: &[u8]) -> Option<(u8, bool, u16)> {
+    (bytes.len() >= 12).then(|| {
+        (
+            bytes[3] & 0x0f,
+            bytes[2] & 2 != 0,
+            u16::from_be_bytes([bytes[6], bytes[7]]),
+        )
+    })
+}
+
 fn word(bytes: &[u8], at: usize) -> Result<u16, ()> {
     let b = bytes.get(at..at + 2).ok_or(())?;
     Ok(u16::from_be_bytes([b[0], b[1]]))

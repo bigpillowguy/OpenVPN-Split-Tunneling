@@ -31,7 +31,7 @@ public sealed class ExperimentalDnsTests
     [Fact]
     public async Task DoesNotAcquireWithoutExplicitPreferenceAndFreshEligibility()
     {
-        var guard = new FakeGuard(); var model = new ExperimentalDnsController(guard, Owner);
+        var guard = new FakeGuard(); var model = new ExperimentalDnsController(guard, Owner, new FakeControl());
         await model.InitializeAsync(false);
         await model.ObserveAsync(Target());
         Assert.Empty(guard.Acquired);
@@ -47,7 +47,7 @@ public sealed class ExperimentalDnsTests
     public async Task LateAcquireAfterDisconnectIsReleasedBeforePauseCompletes()
     {
         var guard = new FakeGuard { BlockAcquire = true };
-        var model = new ExperimentalDnsController(guard, Owner);
+        var model = new ExperimentalDnsController(guard, Owner, new FakeControl());
         model.StateChanged += (_, _) => guard.ObservedStates.Add(model.State);
         await model.InitializeAsync(true);
         var observed = model.ObserveAsync(Target());
@@ -65,7 +65,7 @@ public sealed class ExperimentalDnsTests
     public async Task NewSessionWaitsForOldLeaseRestorationEvenWithSameBackendPid()
     {
         var guard = new FakeGuard { BlockAcquire = true };
-        var model = new ExperimentalDnsController(guard, Owner);
+        var model = new ExperimentalDnsController(guard, Owner, new FakeControl());
         model.StateChanged += (_, _) => guard.ObservedStates.Add(model.State);
         await model.InitializeAsync(true);
         var old = model.ObserveAsync(Target());
@@ -84,7 +84,7 @@ public sealed class ExperimentalDnsTests
     public async Task ExpiredBackendReadinessRevokesActiveLease()
     {
         var now = DateTimeOffset.UtcNow;
-        var guard = new FakeGuard(); var model = new ExperimentalDnsController(guard, Owner, () => now);
+        var guard = new FakeGuard(); var model = new ExperimentalDnsController(guard, Owner, new FakeControl(), () => now);
         await model.InitializeAsync(true); await model.ObserveAsync(Target());
         now += TimeSpan.FromSeconds(3);
         await model.CheckFreshnessAsync();
@@ -96,7 +96,7 @@ public sealed class ExperimentalDnsTests
     public async Task ForeignLiveStartupLeaseIsNotReleasedOrAcquired()
     {
         var guard = new FakeGuard { Recovery = new(1, "busy", Guid.NewGuid(), "live_owner") };
-        var model = new ExperimentalDnsController(guard, Owner);
+        var model = new ExperimentalDnsController(guard, Owner, new FakeControl());
         await model.InitializeAsync(true); await model.ObserveAsync(Target());
         Assert.Equal(ExperimentalDnsState.RecoveryRequired, model.State);
         Assert.Empty(guard.Acquired); Assert.Empty(guard.Released);
@@ -106,7 +106,7 @@ public sealed class ExperimentalDnsTests
     public async Task UnconfirmedReleasePreventsStoppingUntilRetrySucceeds()
     {
         var guard = new FakeGuard { FailRelease = true };
-        var model = new ExperimentalDnsController(guard, Owner);
+        var model = new ExperimentalDnsController(guard, Owner, new FakeControl());
         await model.InitializeAsync(true); await model.ObserveAsync(Target());
         await Assert.ThrowsAsync<InvalidOperationException>(model.PauseAsync);
         Assert.Equal(ExperimentalDnsState.RecoveryRequired, model.State);
@@ -120,7 +120,7 @@ public sealed class ExperimentalDnsTests
     public async Task UncertainAcquireIsRestoredAndDoesNotRetryEverySnapshot()
     {
         var guard = new FakeGuard { ThrowAcquire = true };
-        var model = new ExperimentalDnsController(guard, Owner);
+        var model = new ExperimentalDnsController(guard, Owner, new FakeControl());
         await model.InitializeAsync(true);
         var target = Target(); await model.ObserveAsync(target); await model.ObserveAsync(target);
         Assert.Single(guard.Acquired); Assert.Single(guard.Released);
@@ -131,7 +131,7 @@ public sealed class ExperimentalDnsTests
     public async Task ActiveGuardLeaseMustRemainConfirmed()
     {
         var now = DateTimeOffset.UtcNow;
-        var guard = new FakeGuard(); var model = new ExperimentalDnsController(guard, Owner, () => now);
+        var guard = new FakeGuard(); var model = new ExperimentalDnsController(guard, Owner, new FakeControl(), () => now);
         await model.InitializeAsync(true); var target = Target(); await model.ObserveAsync(target);
         now += TimeSpan.FromSeconds(4); await model.ObserveAsync(target);
         guard.Inspected = Off();
@@ -199,6 +199,116 @@ public sealed class ExperimentalDnsTests
         Assert.Equal(" Blocked packets: 5 (DNS routing error).", ExperimentalDnsDiagnostics.Format(state, true, true));
         state.Fault = ""; state.Dropped = 0;
         Assert.Empty(ExperimentalDnsDiagnostics.Format(state, true, true));
+    }
+
+    [Fact]
+    public async Task ArmAcknowledgementPrecedesGuardAcquireAndDisarmAckPrecedesOff()
+    {
+        var guard = new FakeGuard(); var control = new FakeControl(guard.Calls) { BlockArm = true, BlockDisarm = true };
+        var model = new ExperimentalDnsController(guard, Owner, control);
+        await model.InitializeAsync(true);
+        var observe = model.ObserveAsync(Target());
+        await control.ArmStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Empty(guard.Acquired);
+        control.ArmAck.SetResult(); await observe;
+        Assert.Equal(ExperimentalDnsState.Active, model.State);
+        var pause = model.PauseAsync();
+        await control.DisarmStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Single(guard.Released);
+        Assert.False(pause.IsCompleted);
+        Assert.Equal(ExperimentalDnsState.Restoring, model.State);
+        control.DisarmAck.SetResult(); await pause;
+        Assert.Equal(new[] { "recover", "arm", "acquire", "release", "disarm" }, guard.Calls);
+        Assert.Equal(ExperimentalDnsState.Off, model.State);
+    }
+
+    [Fact]
+    public async Task TimedOutArmIsDisarmedWithoutEverChangingTheWindowsService()
+    {
+        var guard = new FakeGuard(); var control = new FakeControl { ThrowArm = true };
+        var model = new ExperimentalDnsController(guard, Owner, control);
+        await model.InitializeAsync(true); await model.ObserveAsync(Target());
+        Assert.Empty(guard.Acquired); Assert.Empty(guard.Released);
+        Assert.Equal(control.LastArm, control.LastDisarm);
+        Assert.NotNull(control.LastDisarm);
+        Assert.Equal(ExperimentalDnsState.RecoveryRequired, model.State);
+    }
+
+    [Fact]
+    public async Task SupersededArmAcknowledgementCannotStartTheGuard()
+    {
+        var guard = new FakeGuard(); var control = new FakeControl { BlockArm = true };
+        var model = new ExperimentalDnsController(guard, Owner, control);
+        await model.InitializeAsync(true);
+        var observe = model.ObserveAsync(Target());
+        await control.ArmStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var pause = model.PauseAsync();
+        control.ArmAck.SetResult(); await Task.WhenAll(observe, pause);
+        Assert.Empty(guard.Acquired); Assert.Empty(guard.Released);
+        Assert.Equal(control.LastArm, control.LastDisarm);
+        Assert.Equal(ExperimentalDnsState.Off, model.State);
+    }
+
+    [Fact]
+    public async Task FailedGuardRestoreNeverDisarmsAdmission()
+    {
+        var guard = new FakeGuard { FailRelease = true }; var control = new FakeControl();
+        var model = new ExperimentalDnsController(guard, Owner, control);
+        await model.InitializeAsync(true); await model.ObserveAsync(Target());
+        await Assert.ThrowsAsync<InvalidOperationException>(model.PauseAsync);
+        Assert.Null(control.LastDisarm);
+        Assert.Equal(ExperimentalDnsState.RecoveryRequired, model.State);
+    }
+
+    [Fact]
+    public async Task FailedDisarmKeepsLeaseAndPauseBlockedEvenThoughGuardIsAlreadyOff()
+    {
+        var guard = new FakeGuard(); var control = new FakeControl { FailDisarm = true };
+        var model = new ExperimentalDnsController(guard, Owner, control);
+        await model.InitializeAsync(true); await model.ObserveAsync(Target());
+        await Assert.ThrowsAsync<InvalidOperationException>(model.PauseAsync);
+        Assert.Single(guard.Released);
+        control.FailDisarm = false; await model.PauseAsync();
+        Assert.Single(guard.Released); // The confirmed guard release is retained across a control retry.
+        Assert.Equal(ExperimentalDnsState.Off, model.State);
+    }
+
+    [Fact]
+    public async Task LostBackendArmAcknowledgementRestoresGuardBeforeDisarming()
+    {
+        var guard = new FakeGuard(); var control = new FakeControl(guard.Calls);
+        var model = new ExperimentalDnsController(guard, Owner, control);
+        await model.InitializeAsync(true); await model.ObserveAsync(Target());
+        control.Confirmed = false;
+        await model.CheckFreshnessAsync();
+        Assert.Equal(new[] { "recover", "arm", "acquire", "release", "disarm" }, guard.Calls);
+        Assert.Equal(ExperimentalDnsState.RecoveryRequired, model.State);
+    }
+
+    private sealed class FakeControl(List<string>? calls = null) : IDnsControlClient
+    {
+        private Guid? _lease;
+        public Guid? LastArm, LastDisarm;
+        public bool BlockArm, BlockDisarm, ThrowArm, FailDisarm, Confirmed;
+        public readonly TaskCompletionSource ArmStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public readonly TaskCompletionSource ArmAck = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public readonly TaskCompletionSource DisarmStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public readonly TaskCompletionSource DisarmAck = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public async Task ArmAsync(Guid lease, DnsEligibility target)
+        {
+            calls?.Add("arm"); LastArm = _lease = lease; Confirmed = false; ArmStarted.TrySetResult();
+            if (ThrowArm) throw new IOException("Uncertain arm ACK");
+            if (BlockArm) await ArmAck.Task;
+            Confirmed = true;
+        }
+        public async Task DisarmAsync(Guid lease, DnsEligibility target)
+        {
+            calls?.Add("disarm"); LastDisarm = lease; DisarmStarted.TrySetResult();
+            if (FailDisarm) throw new IOException("Uncertain off ACK");
+            if (BlockDisarm) await DisarmAck.Task;
+            _lease = null; Confirmed = false;
+        }
+        public bool IsArmed(Guid lease, DnsEligibility target) => Confirmed && _lease == lease;
     }
 
     private sealed class FakeGuard : IDnsGuardClient

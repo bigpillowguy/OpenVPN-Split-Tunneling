@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "revision": 9007199254740993,
+  "lease": "11223344-5566-7788-99aa-bbccddeeff00",
+  "armed": true,
+  "ownerPid": 1122,
+  "ownerCreationTime": 133000000000000001,
+  "backendPid": 4242,
+  "backendCreationTime": 133000000000000002,
+  "sessionId": "22334455-6677-8899-aabb-ccddeeff0011",
+  "generation": "33445566-7788-99aa-bbcc-ddeeff001122"
+}

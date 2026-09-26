@@ -38,7 +38,9 @@
     <Compile Include="../VpnClient.Ui/ExperimentalDnsController.cs" Link="Production/ExperimentalDnsController.cs" />
     <Compile Include="../VpnClient.Ui/ExperimentalDnsReadiness.cs" Link="Production/ExperimentalDnsReadiness.cs" />
     <Compile Include="../VpnClient.Ui/DnsGuardClient.cs" Link="Production/DnsGuardClient.cs" />
+    <Compile Include="../VpnClient.Ui/DnsControlFile.cs" Link="Production/DnsControlFile.cs" />
     <Compile Include="../VpnClient.Ui/JobManager.cs" Link="Production/JobManager.cs" />
     <Protobuf Include="../../ipc/proto/status.proto" GrpcServices="None" ProtoRoot="../../ipc/proto" />
+    <None Include="../../tests/fixtures/dns-control-arm-v1.json" Link="Fixtures/dns-control-arm-v1.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

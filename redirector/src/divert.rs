@@ -17,6 +17,7 @@ use windivert::prelude::*;
 use windivert_sys::ChecksumFlags;
 
 use crate::adapter::VpnTarget;
+use crate::dns_broker::trace::{self as dns_trace, Category, QueryTrace};
 use crate::flows::{self, FlowTable, PROTO_TCP, PROTO_UDP};
 use crate::pidlookup;
 use crate::policy::{self, PolicyState};
@@ -98,9 +99,28 @@ pub fn run(
     let mut last_vpn = vpn_state::current(&vpn_state);
     let mut last_revalidate = Instant::now();
     let mut last_dns = None;
+    let mut last_control_poll = Instant::now() - split_dns::POLL;
 
     while !shutdown.is_stopped() {
         let now_dns = dns.as_ref().and_then(|authority| authority.ready_session());
+        if let Some(authority) = &dns {
+            if last_control_poll.elapsed() >= split_dns::POLL || now_dns != last_dns {
+                let acknowledgement = authority.poll_control(now_dns.as_ref(), || {
+                    clear_port53_flows(
+                        &mut tcp_flows,
+                        &mut udp_flows,
+                        &mut sockets,
+                        &mut device,
+                        &stats,
+                    );
+                });
+                bus.set_split_dns_control(acknowledgement);
+                last_control_poll = Instant::now();
+            }
+        }
+        let dns_armed = dns
+            .as_ref()
+            .is_some_and(|authority| authority.control_state().armed);
         bus.set_split_dns(
             dns.is_some(),
             now_dns
@@ -158,18 +178,19 @@ pub fn run(
                 &resolver,
                 &tunneled_paths,
                 &bus,
-                dns.as_ref(),
+                dns.as_ref().filter(|_| dns_armed),
+                dns.is_some() && !dns_armed,
             );
         }
 
         let _ = iface.poll(smoltcp::time::Instant::now(), &mut device, &mut sockets);
-        drain_tx(&mut device, &inject, &stats, &tcp_flows, dns.is_some());
+        drain_tx(&mut device, &inject, &stats, &tcp_flows, dns_armed);
 
         service_tcp_flows(&mut tcp_flows, &mut sockets, &tokio_handle, now_vpn, &stats);
         service_udp_flows(&mut udp_flows, &inject, &stats);
 
         let _ = iface.poll(smoltcp::time::Instant::now(), &mut device, &mut sockets);
-        drain_tx(&mut device, &inject, &stats, &tcp_flows, dns.is_some());
+        drain_tx(&mut device, &inject, &stats, &tcp_flows, dns_armed);
         if last_report.elapsed() >= STATS_INTERVAL {
             stats.report_delta(&mut previous_stats, started);
             last_report = Instant::now();
@@ -211,6 +232,67 @@ fn remove_dns_flows(
         stats.bridges_closed.fetch_add(1, Ordering::Relaxed);
         false
     });
+}
+
+fn clear_port53_flows(
+    tcp: &mut HashMap<TcpKey, TcpFlow>,
+    udp: &mut HashMap<UdpKey, UdpFlow>,
+    sockets: &mut SocketSet<'static>,
+    device: &mut VirtualDevice,
+    stats: &Stats,
+) {
+    // No authority callbacks or waits here: the control state mutex is held
+    // until this barrier completes. Aborting JoinHandles never joins workers.
+    tcp.retain(|key, flow| {
+        if key.dst_port != 53 && flow.dns.is_none() {
+            return true;
+        }
+        sockets.remove(flow.handle);
+        if flow.task.is_some() {
+            stats.bridges_closed.fetch_add(1, Ordering::Relaxed);
+        }
+        false
+    });
+    udp.retain(|key, flow| {
+        if key.dst_port != 53 && flow.dns.is_none() {
+            return true;
+        }
+        stats.bridges_closed.fetch_add(1, Ordering::Relaxed);
+        false
+    });
+    device.retain_packets(
+        |packet| {
+            !matches!(
+                parse_ipv4_l4(packet),
+                Some(ParsedL4::Tcp { dst_port: 53, .. } | ParsedL4::Udp { dst_port: 53, .. })
+            )
+        },
+        |packet| {
+            !matches!(
+                parse_ipv4_l4(packet),
+                Some(ParsedL4::Tcp { src_port: 53, .. } | ParsedL4::Udp { src_port: 53, .. })
+            )
+        },
+    );
+}
+
+fn is_extra_dns_capture(bytes: &[u8], loopback: bool) -> bool {
+    if loopback {
+        return true;
+    }
+    let Ok(packet) = SlicedPacket::from_ip(bytes) else {
+        return true;
+    };
+    match packet.net {
+        Some(NetSlice::Ipv4(ip)) => {
+            ip.header().is_fragmenting_payload()
+                || !matches!(
+                    packet.transport,
+                    Some(TransportSlice::Tcp(_) | TransportSlice::Udp(_))
+                )
+        }
+        _ => true,
+    }
 }
 
 fn on_vpn_change(
@@ -259,12 +341,31 @@ struct UdpKey {
     dst_port: u16,
 }
 
+/// The reply belongs on the application's original interface, not the VPN
+/// interface used by our independent provider socket. WinDivert documents
+/// inbound injection only with valid IfIdx/SubIfIdx captured from the stack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReplyInterface {
+    index: u32,
+    subindex: u32,
+}
+
+impl ReplyInterface {
+    fn captured(address: &WinDivertAddress<NetworkLayer>) -> Option<Self> {
+        (address.interface_index() != 0).then_some(Self {
+            index: address.interface_index(),
+            subindex: address.subinterface_index(),
+        })
+    }
+}
+
 struct TcpFlow {
     handle: SocketHandle,
     pid: u32,
     creation_time: u64,
     original_dst: SocketAddr,
     dns: Option<Permit>,
+    reply_interface: Option<ReplyInterface>,
     state: TcpState,
     task: Option<BridgeTask>,
 }
@@ -287,6 +388,7 @@ struct UdpFlow {
     app_endpoint: (Ipv4Addr, u16),
     original_dst: (Ipv4Addr, u16),
     dns: Option<Permit>,
+    reply_interface: Option<ReplyInterface>,
     app_to_remote: mpsc::Sender<Vec<u8>>,
     remote_to_app: mpsc::Receiver<Vec<u8>>,
     last_active: Instant,
@@ -322,6 +424,7 @@ struct TcpRequest {
     destination: SocketAddrV4,
     initial_syn: bool,
     dns: Option<Permit>,
+    reply_interface: Option<ReplyInterface>,
 }
 
 fn ensure_tcp_flow(
@@ -366,12 +469,14 @@ fn ensure_tcp_flow(
             creation_time: request.creation_time,
             original_dst: SocketAddr::V4(request.destination),
             dns: request.dns,
+            reply_interface: request.reply_interface,
             state: TcpState::Pending {
                 since: Instant::now(),
             },
             task: None,
         });
     }
+    flows.get_mut(&request.key).unwrap().reply_interface = request.reply_interface;
     TcpAdmission::Tunnel
 }
 
@@ -381,6 +486,7 @@ struct UdpRequest {
     creation_time: u64,
     target: Option<VpnTarget>,
     dns: Option<Permit>,
+    reply_interface: Option<ReplyInterface>,
 }
 
 fn ensure_udp_flow<'a>(
@@ -398,7 +504,11 @@ fn ensure_udp_flow<'a>(
         return None;
     }
     Some(match flows.entry(request.key) {
-        Entry::Occupied(entry) => entry.into_mut(),
+        Entry::Occupied(entry) => {
+            let flow = entry.into_mut();
+            flow.reply_interface = request.reply_interface;
+            flow
+        }
         Entry::Vacant(entry) => {
             let (a2r_tx, a2r_rx) = mpsc::channel(BRIDGE_CHANNEL_DEPTH);
             let (r2a_tx, r2a_rx) = mpsc::channel(BRIDGE_CHANNEL_DEPTH);
@@ -428,6 +538,7 @@ fn ensure_udp_flow<'a>(
                 app_endpoint: (key.src_ip, key.src_port),
                 original_dst: (key.dst_ip, key.dst_port),
                 dns: request.dns,
+                reply_interface: request.reply_interface,
                 app_to_remote: a2r_tx,
                 remote_to_app: r2a_rx,
                 last_active: Instant::now(),
@@ -533,7 +644,13 @@ fn handle_capture(
     tunneled_paths: &TunneledPaths,
     bus: &Arc<StatusBus>,
     dns_authority: Option<&Arc<split_dns::LiveAuthority>>,
+    dns_inactive: bool,
 ) {
+    if dns_inactive && is_extra_dns_capture(&packet.data, packet.address.loopback()) {
+        let _ = capture.send(&packet);
+        stats.passed.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     let dns = if let Some(authority) = dns_authority {
         match split_dns::inspect(&packet.data, packet.address.loopback()) {
             split_dns::Packet::Other => None,
@@ -555,6 +672,10 @@ fn handle_capture(
                         return;
                     }
                     Decision::Drop(fault) => {
+                        if dns_trace::allow(Category::Ownership) {
+                            tracing::warn!(?owner, reason = fault.code(), %local, %remote, protocol,
+                                "split DNS admission blocked");
+                        }
                         stats.dns_drop(fault);
                         return;
                     }
@@ -568,6 +689,18 @@ fn handle_capture(
                 }
             }
         }
+    } else {
+        None
+    };
+    let reply_interface = if dns.is_some() {
+        let Some(interface) = ReplyInterface::captured(&packet.address) else {
+            stats.dns_drop(Fault::InvalidPacket);
+            if dns_trace::allow(Category::Failure) {
+                tracing::warn!("split DNS packet has no valid reply interface");
+            }
+            return;
+        };
+        Some(interface)
     } else {
         None
     };
@@ -700,6 +833,7 @@ fn handle_capture(
         return;
     }
 
+    let is_dns = dns.is_some();
     if is_tcp {
         let request = TcpRequest {
             key: TcpKey {
@@ -713,6 +847,7 @@ fn handle_capture(
             destination: SocketAddrV4::new(dst_ip, dst_port),
             initial_syn,
             dns,
+            reply_interface,
         };
         match ensure_tcp_flow(tcp_flows, sockets, request, MAX_TCP_FLOWS) {
             TcpAdmission::Tunnel => device.push_rx(packet.data.into_owned()),
@@ -721,7 +856,19 @@ fn handle_capture(
                 stats.passed.fetch_add(1, Ordering::Relaxed);
                 return;
             }
-            TcpAdmission::Drop => {}
+            TcpAdmission::Drop => {
+                if is_dns {
+                    stats.dns_drop(Fault::FlowRejected);
+                    if dns_trace::allow(Category::Failure) {
+                        tracing::warn!(
+                            pid,
+                            initial_syn,
+                            flows = tcp_flows.len(),
+                            "split DNS TCP admission rejected (midstream, capacity or listener)"
+                        );
+                    }
+                }
+            }
         }
         stats.captured.fetch_add(1, Ordering::Relaxed);
     } else {
@@ -736,11 +883,22 @@ fn handle_capture(
             creation_time,
             target: vpn_target,
             dns,
+            reply_interface,
         };
         let Some(flow) = ensure_udp_flow(udp_flows, request, tokio_handle, stats, MAX_UDP_FLOWS)
         else {
             // Reject excess new flows before allocating channels, workers or
             // payload buffers. Existing flows are allowed to drain at the cap.
+            if is_dns {
+                stats.dns_drop(Fault::FlowRejected);
+                if dns_trace::allow(Category::Failure) {
+                    tracing::warn!(
+                        pid,
+                        flows = udp_flows.len(),
+                        "split DNS UDP flow capacity reached"
+                    );
+                }
+            }
             stats.captured.fetch_add(1, Ordering::Relaxed);
             return;
         };
@@ -757,6 +915,8 @@ fn handle_capture(
         if flow.app_to_remote.try_send(payload).is_ok() {
             stats.add_app_to_remote(len);
             stats.add_pid_out(flow.pid, len);
+        } else if is_dns {
+            stats.dns_drop(Fault::QueueUnavailable);
         }
         stats.captured.fetch_add(1, Ordering::Relaxed);
         // packet consumed - do NOT reinject
@@ -771,59 +931,120 @@ fn drain_tx(
     split_dns: bool,
 ) {
     while let Some(data) = device.pop_tx() {
-        if split_dns {
-            if let Some(ParsedL4::Tcp {
-                src_ip,
-                src_port: 53,
-                dst_ip,
-                dst_port,
-                ..
-            }) = parse_ipv4_l4(&data)
-            {
-                let key = TcpKey {
-                    src_ip: dst_ip,
-                    src_port: dst_port,
-                    dst_ip: src_ip,
-                    dst_port: 53,
-                };
-                let owner = pidlookup::owner_for_tuple(
-                    SocketAddr::from((dst_ip, dst_port)),
-                    SocketAddr::from((src_ip, 53)),
-                    PROTO_TCP,
-                );
-                if !tcp_flows
-                    .get(&key)
-                    .and_then(|flow| flow.dns.as_ref())
-                    .is_some_and(|permit| permit.can_deliver_to(owner))
-                {
-                    stats.dns_drop(Fault::Revoked);
+        let reply_interface =
+            match tcp_output_interface(&data, tcp_flows, split_dns, |local, remote| {
+                pidlookup::owner_for_tuple(local, remote, PROTO_TCP)
+            }) {
+                Ok(interface) => interface,
+                Err(fault) => {
+                    stats.dns_drop(fault);
                     continue;
                 }
-            }
-        }
-        send_injected(inject, data, stats);
+            };
+        send_injected(inject, data, stats, reply_interface);
     }
 }
 
-fn send_injected(inject: &WinDivert<NetworkLayer>, data: Vec<u8>, stats: &Stats) {
+fn tcp_output_interface(
+    data: &[u8],
+    tcp_flows: &HashMap<TcpKey, TcpFlow>,
+    dns_armed: bool,
+    owner: impl FnOnce(SocketAddr, SocketAddr) -> pidlookup::OwnerLookup,
+) -> std::result::Result<Option<ReplyInterface>, Fault> {
+    if !dns_armed {
+        return Ok(None);
+    }
+    let Some(ParsedL4::Tcp {
+        src_ip,
+        src_port: 53,
+        dst_ip,
+        dst_port,
+        ..
+    }) = parse_ipv4_l4(data)
+    else {
+        return Ok(None);
+    };
+    let key = TcpKey {
+        src_ip: dst_ip,
+        src_port: dst_port,
+        dst_ip: src_ip,
+        dst_port: 53,
+    };
+    checked_dns_reply_interface(tcp_flows.get(&key), || {
+        owner(
+            SocketAddr::from((dst_ip, dst_port)),
+            SocketAddr::from((src_ip, 53)),
+        )
+    })
+}
+fn checked_dns_reply_interface(
+    flow: Option<&TcpFlow>,
+    owner: impl FnOnce() -> pidlookup::OwnerLookup,
+) -> std::result::Result<Option<ReplyInterface>, Fault> {
+    let flow = flow.ok_or(Fault::Revoked)?;
+    let Some(permit) = &flow.dns else {
+        // With control inactive this is ordinary core routing, just as with the
+        // CLI flag disabled. Do not run experimental attribution or change it.
+        return Ok(None);
+    };
+    if !permit.can_deliver_to(owner()) {
+        return Err(Fault::Revoked);
+    }
+    flow.reply_interface.map(Some).ok_or(Fault::InvalidPacket)
+}
+
+fn injection_address(reply_interface: Option<ReplyInterface>) -> WinDivertAddress<NetworkLayer> {
     let mut addr = unsafe { WinDivertAddress::<NetworkLayer>::new() };
-    addr.set_outbound(true);
+    addr.set_outbound(reply_interface.is_none());
+    if let Some(interface) = reply_interface {
+        addr.set_interface_index(interface.index);
+        addr.set_subinterface_index(interface.subindex);
+    }
     addr.set_ip_checksum(false);
     addr.set_tcp_checksum(false);
     addr.set_udp_checksum(false);
+    addr
+}
+
+fn send_injected(
+    inject: &WinDivert<NetworkLayer>,
+    data: Vec<u8>,
+    stats: &Stats,
+    reply_interface: Option<ReplyInterface>,
+) -> bool {
     let mut pkt = WinDivertPacket {
-        address: addr,
+        address: injection_address(reply_interface),
         data: Cow::Owned(data),
     };
     if let Err(e) = pkt.recalculate_checksums(ChecksumFlags::new()) {
-        tracing::warn!("inject checksum recalc failed: {}", e);
-        return;
+        if reply_interface.is_some() {
+            stats.dns_drop(Fault::InjectionFailed);
+        }
+        if reply_interface.is_none() || dns_trace::allow(Category::Failure) {
+            tracing::warn!(?reply_interface, "inject checksum recalc failed: {}", e);
+        }
+        return false;
     }
     if let Err(e) = inject.send(&pkt) {
-        tracing::warn!("inject send failed: {}", e);
-        return;
+        if reply_interface.is_some() {
+            stats.dns_drop(Fault::InjectionFailed);
+        }
+        if reply_interface.is_none() || dns_trace::allow(Category::Failure) {
+            tracing::warn!(?reply_interface, "inject send failed: {}", e);
+        }
+        return false;
     }
     stats.injected.fetch_add(1, Ordering::Relaxed);
+    if let Some(interface) = reply_interface.filter(|_| dns_trace::allow(Category::Injection)) {
+        tracing::info!(
+            if_index = interface.index,
+            sub_if_index = interface.subindex,
+            bytes = pkt.data.len(),
+            direction = "inbound",
+            "split DNS reply injection accepted by WinDivert"
+        );
+    }
+    true
 }
 
 fn service_tcp_flows(
@@ -940,19 +1161,9 @@ fn service_udp_flows(
                         }
                     }
                     flow.last_active = now;
-                    let Some(pkt) = build_udp_packet(
-                        flow.original_dst.0,
-                        flow.original_dst.1,
-                        flow.app_endpoint.0,
-                        flow.app_endpoint.1,
-                        &payload,
-                    ) else {
-                        stats.dns_drop(Fault::InvalidPacket);
-                        continue;
-                    };
-                    stats.add_remote_to_app(payload.len() as u64);
-                    stats.add_pid_in(flow.pid, payload.len() as u64);
-                    send_injected(inject, pkt, stats);
+                    deliver_udp_response(flow, &payload, stats, |packet, interface| {
+                        send_injected(inject, packet, stats, interface)
+                    });
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -971,6 +1182,41 @@ fn service_udp_flows(
             stats.bridges_closed.fetch_add(1, Ordering::Relaxed);
         }
     }
+}
+
+fn deliver_udp_response(
+    flow: &UdpFlow,
+    payload: &[u8],
+    stats: &Stats,
+    inject: impl FnOnce(Vec<u8>, Option<ReplyInterface>) -> bool,
+) -> bool {
+    if flow.dns.is_some() && flow.reply_interface.is_none() {
+        stats.dns_drop(Fault::InvalidPacket);
+        return false;
+    }
+    let Some(packet) = build_udp_packet(
+        flow.original_dst.0,
+        flow.original_dst.1,
+        flow.app_endpoint.0,
+        flow.app_endpoint.1,
+        payload,
+    ) else {
+        stats.dns_drop(Fault::InvalidPacket);
+        return false;
+    };
+    let accepted = inject(packet, flow.reply_interface);
+    if accepted {
+        // Means accepted by WinDivert, not that the application consumed it.
+        stats.add_remote_to_app(payload.len() as u64);
+        stats.add_pid_in(flow.pid, payload.len() as u64);
+    }
+    if flow.dns.is_some() && dns_trace::allow(Category::Injection) {
+        let header = crate::dns_broker::wire::response_header(payload);
+        tracing::info!(pid = flow.pid, source = ?flow.original_dst, destination = ?flow.app_endpoint,
+            interface = ?flow.reply_interface, ?header, bytes = payload.len(), accepted,
+            "split DNS UDP reply injection result (rcode_low,tc,answers)");
+    }
+    accepted
 }
 
 fn pump_tcp_app_to_remote(
@@ -1170,13 +1416,29 @@ async fn tcp_dns_bridge_bound(
                 .map_err(|code| anyhow::anyhow!("DNS socket binding failed: {code}"))?;
             // Try only current provider endpoints, and only before any bytes
             // are sent. Never replay a partially written DNS stream elsewhere.
-            if let Ok(Ok(stream)) = tokio::time::timeout(
+            let connected = tokio::time::timeout(
                 Duration::from_secs(2),
                 socket.connect(SocketAddr::V4(*server)),
             )
-            .await
-            {
-                return tcp_stream_bridge(stream, from_app, to_app, Some(&permit)).await;
+            .await;
+            match connected {
+                Ok(Ok(stream)) => {
+                    if dns_trace::allow(Category::Outcome) {
+                        tracing::info!(pid = permit.lease.pid, provider = %server,
+                            "split DNS TCP provider connected");
+                    }
+                    return tcp_stream_bridge(stream, from_app, to_app, Some(&permit)).await;
+                }
+                result => {
+                    if dns_trace::allow(Category::Failure) {
+                        let os_error = result
+                            .ok()
+                            .and_then(|result| result.err())
+                            .and_then(|error| error.raw_os_error());
+                        tracing::warn!(pid = permit.lease.pid, provider = %server, ?os_error,
+                            "split DNS TCP provider connect failed or timed out");
+                    }
+                }
             }
         }
         anyhow::bail!("all provider DNS TCP endpoints failed")
@@ -1204,17 +1466,52 @@ async fn udp_dns_bridge_bound(
         while let Some(query) = from_app.recv().await {
             permit.check()?;
             let Ok(question) = wire::query(&query) else {
+                if dns_trace::allow(Category::Failure) {
+                    tracing::warn!(
+                        pid = permit.lease.pid,
+                        bytes = query.len(),
+                        "split DNS UDP query envelope rejected"
+                    );
+                }
                 continue;
             };
+            let trace = QueryTrace::new(permit.lease.pid, question.kind());
+            if dns_trace::allow(Category::Query) {
+                tracing::info!(
+                    serial = trace.serial,
+                    pid = trace.pid,
+                    qtype = trace.qtype,
+                    bytes = query.len(),
+                    "split DNS UDP query accepted"
+                );
+            }
             // Bounded sequential requests per flow. UDP overload is dropped by
             // the existing bounded channel; it never opens a direct resolver.
-            if let Ok(response) =
-                transport::exchange_datagram(binding, &permit.lease.dns.servers, &query, &question)
-                    .await
+            match transport::exchange_datagram(
+                binding,
+                &permit.lease.dns.servers,
+                &query,
+                &question,
+                trace,
+            )
+            .await
             {
-                permit.check()?;
-                if response.len() <= 65507 && to_app.send(response).await.is_err() {
-                    return Ok(());
+                Ok(response) => {
+                    permit.check()?;
+                    if response.len() <= 65507 && to_app.send(response).await.is_err() {
+                        return Ok(());
+                    }
+                }
+                Err(code) => {
+                    if dns_trace::allow(Category::Failure) {
+                        tracing::warn!(
+                            serial = trace.serial,
+                            pid = trace.pid,
+                            qtype = trace.qtype,
+                            code,
+                            "split DNS UDP query failed; no direct fallback"
+                        );
+                    }
                 }
             }
         }

@@ -7,6 +7,7 @@ use tokio::net::{TcpSocket, UdpSocket};
 use windows::Win32::Networking::WinSock::{setsockopt, WSAGetLastError, IPPROTO_IP, SOCKET};
 use windows::Win32::Security::Cryptography::{BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG};
 
+use super::trace::{self, Category, QueryTrace};
 use super::{wire, SERVER_FAILURE, TIMEOUT};
 use crate::adapter::VpnTarget;
 
@@ -67,7 +68,7 @@ pub async fn exchange(
     request: &[u8],
     question: &wire::Question,
 ) -> Result<Vec<u8>, u32> {
-    exchange_mode(binding, servers, request, question, true).await
+    exchange_mode(binding, servers, request, question, true, None).await
 }
 
 /// Transparent UDP interception must preserve TC. The original application
@@ -77,8 +78,9 @@ pub async fn exchange_datagram(
     servers: &[SocketAddrV4],
     request: &[u8],
     question: &wire::Question,
+    trace: QueryTrace,
 ) -> Result<Vec<u8>, u32> {
-    exchange_mode(binding, servers, request, question, false).await
+    exchange_mode(binding, servers, request, question, false, Some(trace)).await
 }
 
 async fn exchange_mode(
@@ -87,6 +89,7 @@ async fn exchange_mode(
     request: &[u8],
     question: &wire::Question,
     tcp_fallback: bool,
+    trace: Option<QueryTrace>,
 ) -> Result<Vec<u8>, u32> {
     let mut random = [0; 2];
     unsafe { BCryptGenRandom(None, &mut random, BCRYPT_USE_SYSTEM_PREFERRED_RNG) }
@@ -97,18 +100,32 @@ async fn exchange_mode(
     query[..2].copy_from_slice(&id.to_be_bytes());
     let mut last = SERVER_FAILURE;
     for server in servers {
+        let started = std::time::Instant::now();
         let attempt = tokio::time::timeout(
             Duration::from_secs(2),
-            one(binding, *server, &query, id, question, tcp_fallback),
+            one(binding, *server, &query, id, question, tcp_fallback, trace),
         )
         .await;
         match attempt {
             Ok(Ok(mut response)) => {
+                if let Some(trace) = trace.filter(|_| trace::allow(Category::Outcome)) {
+                    let (rcode_low, tc, answers) = wire::response_header(&response).unwrap();
+                    tracing::info!(
+                        serial = trace.serial, pid = trace.pid, qtype = trace.qtype,
+                        provider = %server, source = %binding.source, interface = ?binding.interface,
+                        rcode_low, tc, answers, bytes = response.len(),
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "split DNS provider response validated"
+                    );
+                }
                 response[..2].copy_from_slice(&request[..2]);
                 return Ok(response);
             }
             Ok(Err(status)) => last = status,
-            Err(_) => last = TIMEOUT,
+            Err(_) => {
+                log_failure(trace, *server, "deadline", TIMEOUT, None);
+                last = TIMEOUT;
+            }
         }
     }
     Err(last)
@@ -121,20 +138,29 @@ async fn one(
     id: u16,
     question: &wire::Question,
     tcp_fallback: bool,
+    trace: Option<QueryTrace>,
 ) -> Result<Vec<u8>, u32> {
     let socket = UdpSocket::bind(SocketAddrV4::new(binding.source, 0))
         .await
-        .map_err(|_| SERVER_FAILURE)?;
-    binding.pin(&socket)?;
+        .map_err(|error| io_failure(trace, server, "bind", error))?;
+    binding.pin(&socket).inspect_err(|code| {
+        log_failure(trace, server, "pin_interface", *code, None);
+    })?;
     // Connected UDP restricts response source to the exact provider endpoint.
-    socket.connect(server).await.map_err(|_| SERVER_FAILURE)?;
-    socket.send(query).await.map_err(|_| SERVER_FAILURE)?;
+    socket
+        .connect(server)
+        .await
+        .map_err(|error| io_failure(trace, server, "connect", error))?;
+    socket
+        .send(query)
+        .await
+        .map_err(|error| io_failure(trace, server, "send", error))?;
     let mut response = vec![0; wire::MAX_RESPONSE];
     for _ in 0..16 {
         let received = socket
             .recv(&mut response)
             .await
-            .map_err(|_| SERVER_FAILURE)?;
+            .map_err(|error| io_failure(trace, server, "receive", error))?;
         match wire::response(&response[..received], id, question) {
             Ok(wire::Response::Truncated) if tcp_fallback => {
                 return tcp(binding, server, query, id, question).await
@@ -143,10 +169,35 @@ async fn one(
                 response.truncate(received);
                 return Ok(response);
             }
-            Err(()) => {} // Ignore mismatched IDs/questions, with bounded work/deadline.
+            Err(()) => {
+                log_failure(trace, server, "response_envelope", SERVER_FAILURE, None);
+            } // Ignore mismatched IDs/questions, with bounded work/deadline.
         }
     }
     Err(SERVER_FAILURE)
+}
+
+fn io_failure(
+    trace: Option<QueryTrace>,
+    server: SocketAddrV4,
+    stage: &'static str,
+    error: std::io::Error,
+) -> u32 {
+    log_failure(trace, server, stage, SERVER_FAILURE, error.raw_os_error());
+    SERVER_FAILURE
+}
+
+fn log_failure(
+    trace: Option<QueryTrace>,
+    server: SocketAddrV4,
+    stage: &'static str,
+    code: u32,
+    os_error: Option<i32>,
+) {
+    if let Some(trace) = trace.filter(|_| trace::allow(Category::Failure)) {
+        tracing::warn!(serial = trace.serial, pid = trace.pid, qtype = trace.qtype,
+            provider = %server, stage, code, ?os_error, "split DNS provider attempt failed");
+    }
 }
 
 async fn tcp(

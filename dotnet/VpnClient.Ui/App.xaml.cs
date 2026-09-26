@@ -13,7 +13,7 @@ public partial class App : Application
     private static ExperimentalDnsController CreateDnsController()
     {
         using var owner = Process.GetCurrentProcess();
-        return new(new DnsGuardClient(AppContext.BaseDirectory), new(checked((uint)owner.Id), checked((ulong)owner.StartTime.ToFileTimeUtc())));
+        return new(new DnsGuardClient(AppContext.BaseDirectory), new(checked((uint)owner.Id), checked((ulong)owner.StartTime.ToFileTimeUtc())), new RedirectorDnsControlClient());
     }
     private Mutex? _instance;
     private bool _ownsInstance;

@@ -13,6 +13,9 @@ public static class SnapshotValidator
         if (snapshot.Vpn is null || snapshot.Vpn.UptimeMs > (ulong)(TimeSpan.MaxValue.Ticks / TimeSpan.TicksPerMillisecond)) return false;
         if (snapshot.Vpn.Up && (!IPAddress.TryParse(snapshot.Vpn.AdapterIp, out var address) || address.AddressFamily != AddressFamily.InterNetwork)) return false;
         if (snapshot.SplitDns is { } dns && (dns.Fault.Length > 64 || dns.SessionId.Length > 32 || dns.Generation.Length > 32 ||
+            dns.ControlError.Length > 64 || dns.ControlLease.Length > 32 ||
+            (dns.ControlRevision > 0 && !IsWireGuid(dns.ControlLease)) ||
+            (dns.Armed && (!dns.Enabled || dns.ControlRevision == 0 || !IsWireGuid(dns.ControlLease))) ||
             (dns.Ready && (!dns.Enabled || !IsWireGuid(dns.SessionId) || !IsWireGuid(dns.Generation))))) return false;
         if (snapshot.Apps.Count > 1024) return false;
         var paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);

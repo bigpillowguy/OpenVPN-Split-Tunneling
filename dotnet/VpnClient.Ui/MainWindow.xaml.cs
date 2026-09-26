@@ -100,6 +100,7 @@ public partial class MainWindow : FluentWindow
         {
             _snapshot = snapshot;
             _snapshotReceivedAt = receivedAt;
+            Redirector.ObserveDnsControl(snapshot, receivedAt);
             RefreshConnectionState();
 
             var totals = snapshot.Totals;

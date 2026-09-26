@@ -25,6 +25,15 @@ impl VirtualDevice {
     pub fn pop_tx(&mut self) -> Option<Vec<u8>> {
         self.tx.pop_front()
     }
+
+    pub fn retain_packets(
+        &mut self,
+        mut keep_rx: impl FnMut(&[u8]) -> bool,
+        mut keep_tx: impl FnMut(&[u8]) -> bool,
+    ) {
+        self.rx.retain(|packet| keep_rx(packet));
+        self.tx.retain(|packet| keep_tx(packet));
+    }
 }
 
 impl Device for VirtualDevice {

@@ -38,6 +38,11 @@ message SplitDnsState {
   string generation = 4;
   uint64 dropped = 5;
   string fault = 6; // bounded, controlled diagnostic code; no packet data
+  // Applied private control command. Provider readiness above is independent.
+  bool armed = 7;
+  string control_lease = 8; // lowercase GUID N, empty before first applied command
+  uint64 control_revision = 9;
+  string control_error = 10; // controlled code; invalid input retains applied state
 }
 
 message VpnState {

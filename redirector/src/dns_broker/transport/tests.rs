@@ -9,6 +9,48 @@ fn reply(query: &[u8], truncated: bool) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn transparent_udp_preserves_positive_answer_and_edns_metadata() {
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let SocketAddr::V4(endpoint) = server.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let opt = [0, 0, 41, 4, 208, 0, 0, 0, 0, 0, 0]; // EDNS UDP size1232.
+    let answer_rr = [0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 9];
+    let mut query = wire::test_query();
+    query[11] = 1;
+    query.extend_from_slice(&opt);
+    let task = tokio::spawn(async move {
+        let mut request = [0; 4096];
+        let (size, peer) = server.recv_from(&mut request).await.unwrap();
+        let mut response = request[..size - opt.len()].to_vec();
+        response[2] = 0x81;
+        response[3] = 0x80;
+        response[7] = 1;
+        response.extend_from_slice(&answer_rr);
+        response.extend_from_slice(&opt);
+        server.send_to(&response, peer).await.unwrap();
+    });
+    let question = wire::query(&query).unwrap();
+    let response = exchange_datagram(
+        Binding::loopback(),
+        &[endpoint],
+        &query,
+        &question,
+        QueryTrace::new(std::process::id(), question.kind()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(&response[..2], &query[..2]);
+    assert_eq!(wire::response_header(&response), Some((0, false, 1)));
+    assert_eq!(
+        &response[query.len() - opt.len()..response.len() - opt.len()],
+        &answer_rr
+    );
+    assert!(response.ends_with(&opt));
+    task.await.unwrap();
+}
+
+#[tokio::test]
 async fn udp_ignores_wrong_id_and_question_and_restores_client_id() {
     let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let endpoint = match server.local_addr().unwrap() {

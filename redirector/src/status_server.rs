@@ -133,6 +133,15 @@ impl StatusBus {
         };
     }
 
+    /// The capture loop publishes this only after its flow/packet cleanup barrier.
+    pub fn set_split_dns_control(&self, acknowledgement: crate::dns_control::Acknowledgement) {
+        let mut status = self.split_dns.lock().unwrap();
+        status.state.armed = acknowledgement.armed;
+        status.state.control_lease = acknowledgement.lease.map(guid_hex).unwrap_or_default();
+        status.state.control_revision = acknowledgement.revision;
+        status.state.control_error = acknowledgement.error.into();
+    }
+
     pub fn clear_split_dns_fault(&self) {
         self.split_dns.lock().unwrap().state.fault.clear();
     }
@@ -400,7 +409,7 @@ fn build_snapshot(
         .collect();
 
     let msg = StatusMessage {
-        body: Some(Body::Snapshot(Snapshot {
+        body: Some(Body::Snapshot(Box::new(Snapshot {
             vpn: Some(VpnState {
                 up,
                 adapter_ip,
@@ -419,7 +428,7 @@ fn build_snapshot(
                 Instant::now(),
                 now.map(|target| target.session_id),
             )),
-        })),
+        }))),
     };
     (msg, next_pids)
 }

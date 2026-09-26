@@ -13,6 +13,7 @@ public static class Redirector
     private static EventWaitHandle? _shutdown;
     private static VpnSessionBindingStore? _sessionBindings;
     private static Task? _exitWatch;
+    private static DnsControlFile? _dnsControl;
     private static volatile bool _stopping;
     private static volatile string? _failure;
 
@@ -29,6 +30,10 @@ public static class Redirector
         }
     }
     public static event EventHandler? StateChanged;
+    internal static void ObserveDnsControl(Vpnclient.Status.Snapshot snapshot, long receivedAt) => _dnsControl?.Observe(snapshot, receivedAt);
+    internal static bool IsDnsArmed(Guid lease, DnsEligibility target) => _dnsControl?.IsArmed(lease, target) == true;
+    internal static Task ApplyDnsControlAsync(Guid lease, DnsEligibility target, bool armed) =>
+        (_dnsControl ?? throw new InvalidOperationException("This backend does not support experimental DNS control.")).ApplyAsync(lease, target, armed);
     public static bool IsRunning
     {
         get
@@ -72,6 +77,8 @@ public static class Redirector
         _sessionBindings.SnapshotChanged += (_, _) => StateChanged?.Invoke(null, EventArgs.Empty);
         start.ArgumentList.Add("--session-file");
         start.ArgumentList.Add(_sessionBindings.FilePath);
+        string controlPath = Path.Combine(Path.GetDirectoryName(_sessionBindings.FilePath)!, "dns-control.json");
+        if (splitDns) { start.ArgumentList.Add("--dns-control-file"); start.ArgumentList.Add(controlPath); }
         LogPath = Path.Combine(Path.GetDirectoryName(_sessionBindings.FilePath)!, "redirector.log");
         start.ArgumentList.Add("--log-file");
         start.ArgumentList.Add(LogPath);
@@ -79,6 +86,13 @@ public static class Redirector
         try
         {
             _process = JobManager.Start(start);
+            if (splitDns)
+            {
+                using var owner = Process.GetCurrentProcess();
+                var retained = _process;
+                _dnsControl = new(controlPath, new(checked((uint)owner.Id), checked((ulong)owner.StartTime.ToFileTimeUtc())),
+                    Identity ?? throw new InvalidOperationException("The backend exited during DNS setup."), () => !retained.HasExited);
+            }
             _exitWatch = ObserveExitAsync(_process);
             StateChanged?.Invoke(null, EventArgs.Empty);
         }
@@ -131,6 +145,7 @@ public static class Redirector
     public static void Dispose()
     {
         _stopping = true;
+        _dnsControl?.Dispose(); _dnsControl = null;
         _sessionBindings?.Dispose(); _sessionBindings = null;
         _shutdown?.Dispose(); _shutdown = null;
         _process?.Dispose(); _process = null;

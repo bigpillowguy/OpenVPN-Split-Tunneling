@@ -18,7 +18,7 @@ profile and any credentials required by your provider.
   physical interface.
 - The client is **fail-open**: when the VPN is unavailable, selected applications
   may use the default route. This is not a kill switch or an anonymity boundary.
-- **DNS remains unchanged by default.** Version 1.3.1 includes an opt-in experimental
+- **DNS remains unchanged by default.** Version 1.3.2 includes an opt-in experimental
   mode for ordinary IPv4 DNS on UDP/TCP port 53. It redirects selected executables'
   queries to the current VPN provider's DNS through the VPN interface. This mode
   temporarily replaces the shared Windows DNS Client service (`Dnscache`), which
@@ -44,6 +44,11 @@ profile and any credentials required by your provider.
 The unit tests and build pipeline do not replace install/upgrade/uninstall and
 packet-capture acceptance tests on a disposable Windows machine. See
 [REVIEW.md](REVIEW.md) and [TODO.md](TODO.md) for the audit and verification plan.
+
+The 1.3.1 live trial reached DNS mode activation but failed name resolution;
+turning the mode off restored ordinary DNS. Version 1.3.2 corrects the DNS reply
+injection direction and separates filter activation from the saved option.
+Live acceptance remains open; keep experimental DNS off for regular use.
 
 ## Install and use
 
@@ -207,7 +212,7 @@ The script enters the repository root, puts rustup before any older system Rust
 installation, checks MSVC, builds with `Cargo.lock`, publishes the UI and DNS recovery helper, verifies
 NuGet dependencies against `packages.lock.json`, checks the WinDivert staging
 files, and compiles setup. It **never executes the setup**.
-The output is `installer/Output/VpnClientSetup-1.3.1.exe`.
+The output is `installer/Output/VpnClientSetup-1.3.2.exe`.
 
 The bundled OpenVPN download is pinned by SHA-256 and requires a valid OpenVPN
 Authenticode signature. Every cached use is checked; downloads are verified
@@ -247,7 +252,7 @@ and fail if the package graph disagrees with the committed lockfile.
 Windows CI is configured to check formatting, clippy and tests, and produce an
 unsigned installer artifact without installing OpenVPN or starting VPN/driver
 processes. Product/setup version
-`1.3.1` and internal Rust workspace crate version `0.1.0` are separate identifiers.
+`1.3.2` and internal Rust workspace crate version `0.1.0` are separate identifiers.
 
 ## Source layout and licenses
 

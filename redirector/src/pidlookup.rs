@@ -159,30 +159,49 @@ impl OwnerLookup {
 /// entire four-tuple; UDP reports ambiguity across all matching wildcard/exact
 /// owners because the OS UDP table does not provide the remote endpoint.
 pub fn owner_for_tuple(local: SocketAddr, remote: SocketAddr, proto: u8) -> OwnerLookup {
-    let lookup = || {
+    let started = std::time::Instant::now();
+    let mut lookup_failed = false;
+    let mut lookup = || {
         let result = owner_once(local, remote, proto);
         if let (SocketAddr::V4(local), SocketAddr::V4(remote)) = (local, remote) {
             // IPv4 packets can originate from dual-stack IPv6 sockets. UDP
             // tables do not expose IPV6_V6ONLY, so a competing IPv6 wildcard
             // owner conservatively makes the decision ambiguous.
-            return combine_families(
-                result,
-                owner_once(
-                    SocketAddr::new(local.ip().to_ipv6_mapped().into(), local.port()),
-                    SocketAddr::new(remote.ip().to_ipv6_mapped().into(), remote.port()),
-                    proto,
-                ),
+            let mapped = owner_once(
+                SocketAddr::new(local.ip().to_ipv6_mapped().into(), local.port()),
+                SocketAddr::new(remote.ip().to_ipv6_mapped().into(), remote.port()),
+                proto,
             );
+            lookup_failed = result.is_none() || mapped.is_none();
+            return combine_families(result, mapped);
         }
+        lookup_failed = result.is_none();
         result.unwrap_or(OwnerLookup::Unknown)
     };
     let mut result = lookup();
     for _ in 0..4 {
-        if result != OwnerLookup::Unknown {
+        if !matches!(result, OwnerLookup::Unknown | OwnerLookup::Unique(0)) {
             break;
         }
         std::thread::sleep(std::time::Duration::from_micros(200));
         result = lookup();
+    }
+    if matches!(
+        result,
+        OwnerLookup::Unknown | OwnerLookup::Ambiguous | OwnerLookup::Unique(0)
+    ) && crate::dns_broker::trace::allow(crate::dns_broker::trace::Category::Ownership)
+    {
+        let reason = if lookup_failed {
+            "native_table_unavailable"
+        } else {
+            match result {
+                OwnerLookup::Unknown => "successful_table_no_match",
+                OwnerLookup::Unique(0) => "row_owner_unavailable",
+                _ => "multiple_endpoint_owners",
+            }
+        };
+        tracing::warn!(%local, %remote, proto, reason,
+            elapsed_us = started.elapsed().as_micros() as u64, "split DNS owner lookup unresolved");
     }
     result
 }
@@ -312,6 +331,9 @@ fn owner_table(proto: u8, family: u32) -> Option<(Vec<u64>, usize)> {
             return Some((storage, bytes as usize));
         }
         if rc != ERROR_INSUFFICIENT_BUFFER.0 {
+            if crate::dns_broker::trace::allow(crate::dns_broker::trace::Category::Ownership) {
+                tracing::warn!(proto, family, rc, "split DNS native owner table failed");
+            }
             return None;
         }
     }

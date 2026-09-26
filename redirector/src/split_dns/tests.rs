@@ -22,6 +22,7 @@ pub(crate) fn lease() -> Lease {
             open_vpn_pid: 999,
             open_vpn_creation_time: 777,
         },
+        control_revision: 0,
     }
 }
 
@@ -99,7 +100,7 @@ fn unknown_and_ambiguous_are_dropped_but_backend_is_excluded() {
 
 #[tokio::test]
 async fn generation_owner_adapter_and_session_changes_revoke_even_completed_work() {
-    for change in 0..7 {
+    for change in 0..8 {
         let (permit, authority) = permit();
         let mut next = permit.lease.clone();
         match change {
@@ -109,6 +110,7 @@ async fn generation_owner_adapter_and_session_changes_revoke_even_completed_work
             3 => next.dns.open_vpn_creation_time += 1,
             4 => next.creation_time += 1,
             5 => next.exe_path.push('x'),
+            6 => next.control_revision += 1,
             _ => next.dns.servers[0] = "10.8.0.3:53".parse().unwrap(),
         }
         let result = permit

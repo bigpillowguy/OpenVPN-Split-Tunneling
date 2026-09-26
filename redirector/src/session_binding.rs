@@ -249,7 +249,7 @@ fn usable_unicast(ip: Ipv4Addr) -> bool {
         && (1..224).contains(&ip.octets()[0])
 }
 
-fn guid(value: &str) -> Result<[u8; 16]> {
+pub(crate) fn guid(value: &str) -> Result<[u8; 16]> {
     let value = value
         .strip_prefix('{')
         .and_then(|s| s.strip_suffix('}'))

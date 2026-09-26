@@ -8,6 +8,215 @@ use tokio::time::timeout;
 const TEST_PID: u32 = 123;
 const DEADLINE: Duration = Duration::from_secs(5);
 
+fn raw_tcp(src: u16, dst: u16) -> Vec<u8> {
+    let mut packet = vec![0; 40];
+    packet[0] = 0x45;
+    packet[2..4].copy_from_slice(&40u16.to_be_bytes());
+    packet[8] = 64;
+    packet[9] = 6;
+    packet[12..16].copy_from_slice(&[10, 0, 0, 2]);
+    packet[16..20].copy_from_slice(&[10, 0, 0, 1]);
+    packet[20..22].copy_from_slice(&src.to_be_bytes());
+    packet[22..24].copy_from_slice(&dst.to_be_bytes());
+    packet[32] = 0x50;
+    packet[33] = 4;
+    packet
+}
+
+#[test]
+fn inactive_dns_preserves_baseline_unknown_rst_and_generic_tcp53() {
+    let packet = raw_tcp(53, 40000);
+    let mut flows = HashMap::new();
+    assert_eq!(
+        tcp_output_interface(&packet, &flows, false, |_, _| panic!(
+            "inactive must not attribute"
+        )),
+        Ok(None)
+    );
+    assert_eq!(
+        tcp_output_interface(&packet, &flows, true, |_, _| panic!(
+            "no flow cannot be authorized"
+        )),
+        Err(Fault::Revoked)
+    );
+    let mut sockets = SocketSet::new(Vec::new());
+    let mut request = tcp_request(40000, true);
+    request.destination.set_port(53);
+    request.key.dst_port = 53;
+    assert_eq!(
+        ensure_tcp_flow(&mut flows, &mut sockets, request, 1),
+        TcpAdmission::Tunnel
+    );
+    assert_eq!(
+        tcp_output_interface(&packet, &flows, false, |_, _| panic!(
+            "generic routing stays unchanged"
+        )),
+        Ok(None)
+    );
+    let normal = raw_tcp(443, 40000);
+    assert_eq!(
+        tcp_output_interface(&normal, &flows, true, |_, _| panic!("not DNS")),
+        Ok(None)
+    );
+}
+
+#[test]
+fn control_transition_clears_dns_workers_sockets_and_queued_packets_before_off_ack() {
+    use smoltcp::phy::{Device, RxToken, TxToken};
+    let mut tcp = HashMap::new();
+    let mut udp = HashMap::new();
+    let mut sockets = SocketSet::new(Vec::new());
+    let mut request = tcp_request(40000, true);
+    request.destination.set_port(53);
+    request.key.dst_port = 53;
+    assert_eq!(
+        ensure_tcp_flow(&mut tcp, &mut sockets, request, 4),
+        TcpAdmission::Tunnel
+    );
+    assert_eq!(
+        ensure_tcp_flow(&mut tcp, &mut sockets, tcp_request(40001, true), 4),
+        TcpAdmission::Tunnel
+    );
+    let mut device = VirtualDevice::new();
+    let now = smoltcp::time::Instant::from_millis(0);
+    let dns_rx = raw_tcp(40000, 53);
+    let normal_rx = raw_tcp(40001, 443);
+    device.push_rx(dns_rx);
+    device.push_rx(normal_rx.clone());
+    let normal_tx = raw_tcp(443, 40001);
+    for bytes in [raw_tcp(53, 40000), normal_tx.clone()] {
+        device
+            .transmit(now)
+            .unwrap()
+            .consume(bytes.len(), |packet| packet.copy_from_slice(&bytes));
+    }
+    clear_port53_flows(&mut tcp, &mut udp, &mut sockets, &mut device, &stats());
+    assert_eq!(tcp.len(), 1);
+    assert_eq!(sockets.iter().count(), 1);
+    assert!(tcp.keys().all(|key| key.dst_port != 53));
+    assert_eq!(device.pop_tx(), Some(normal_tx));
+    assert!(device.pop_tx().is_none());
+    let (rx, _) = device.receive(now).unwrap();
+    assert_eq!(rx.consume(|packet| packet.to_vec()), normal_rx);
+    assert!(device.receive(now).is_none());
+}
+
+#[test]
+fn inactive_extra_capture_reinjects_ipv6_loopback_and_fragments_without_dns_policy() {
+    let mut v4 = build_udp_packet(
+        Ipv4Addr::new(192, 0, 2, 1),
+        40000,
+        Ipv4Addr::new(192, 0, 2, 53),
+        53,
+        &[0; 12],
+    )
+    .unwrap();
+    assert!(!is_extra_dns_capture(&v4, false));
+    assert!(is_extra_dns_capture(&v4, true));
+    v4[6] |= 0x20;
+    assert!(is_extra_dns_capture(&v4, false));
+    let mut v6 = Vec::new();
+    etherparse::PacketBuilder::ipv6([1; 16], [2; 16], 64)
+        .udp(40000, 53)
+        .write(&mut v6, &[0; 12])
+        .unwrap();
+    assert!(is_extra_dns_capture(&v6, false));
+}
+
+#[tokio::test]
+async fn dns_udp_reply_uses_original_inbound_interface_and_counts_only_accepted_injection() {
+    let (permit, _) = crate::split_dns::tests::permit();
+    let (app_to_remote, _) = mpsc::channel(1);
+    let (_, remote_to_app) = mpsc::channel(1);
+    let mut captured = unsafe { WinDivertAddress::<NetworkLayer>::new() };
+    captured.set_outbound(true);
+    captured.set_interface_index(17);
+    captured.set_subinterface_index(3);
+    let mut flow = UdpFlow {
+        pid: permit.lease.pid,
+        creation_time: permit.lease.creation_time,
+        app_endpoint: (Ipv4Addr::new(192, 168, 1, 63), 49664),
+        original_dst: (Ipv4Addr::new(8, 8, 8, 8), 53),
+        dns: Some(permit),
+        reply_interface: ReplyInterface::captured(&captured),
+        app_to_remote,
+        remote_to_app,
+        last_active: Instant::now(),
+        _task: BridgeTask(tokio::spawn(std::future::pending())),
+    };
+    let mut response = crate::dns_broker::wire::test_query();
+    response[2] = 0x81;
+    response[3] = 0x83; // Preserve a provider NXDOMAIN; never invent one.
+    let stats = stats();
+    assert!(!deliver_udp_response(
+        &flow,
+        &response,
+        &stats,
+        |packet, interface| {
+            let address = injection_address(interface);
+            assert!(!address.outbound());
+            assert_eq!(address.interface_index(), 17);
+            assert_eq!(address.subinterface_index(), 3);
+            assert!(!address.ip_checksum() && !address.udp_checksum());
+            let parsed = SlicedPacket::from_ip(&packet).unwrap();
+            let Some(NetSlice::Ipv4(ip)) = parsed.net else {
+                panic!("IPv4 required")
+            };
+            assert_eq!(ip.header().source_addr(), flow.original_dst.0);
+            assert_eq!(ip.header().destination_addr(), flow.app_endpoint.0);
+            let Some(TransportSlice::Udp(udp)) = parsed.transport else {
+                panic!("UDP required")
+            };
+            assert_eq!((udp.source_port(), udp.destination_port()), (53, 49664));
+            assert_eq!(udp.payload(), response);
+            false // Failed native injection must not be presented as bytes delivered.
+        }
+    ));
+    assert_eq!(stats.bus.bytes_in.load(Ordering::Relaxed), 0);
+    assert!(deliver_udp_response(&flow, &response, &stats, |_, _| true));
+    assert_eq!(
+        stats.bus.bytes_in.load(Ordering::Relaxed),
+        response.len() as u64
+    );
+    flow.reply_interface = None;
+    assert!(!deliver_udp_response(
+        &flow,
+        &response,
+        &stats,
+        |_, _| panic!("missing interface must block")
+    ));
+    assert_eq!(
+        stats.bus.bytes_in.load(Ordering::Relaxed),
+        response.len() as u64
+    );
+}
+
+#[test]
+fn dns_tcp_preserves_captured_interface_and_general_injection_stays_unchanged() {
+    let mut flows = HashMap::new();
+    let mut sockets = SocketSet::new(Vec::new());
+    let mut request = tcp_request(40000, true);
+    request.dns = Some(crate::split_dns::tests::permit().0);
+    request.reply_interface = Some(ReplyInterface {
+        index: 17,
+        subindex: 3,
+    });
+    let key = request.key;
+    assert_eq!(
+        ensure_tcp_flow(&mut flows, &mut sockets, request, 1),
+        TcpAdmission::Tunnel
+    );
+    let address = injection_address(flows[&key].reply_interface);
+    assert!(!address.outbound());
+    assert_eq!(
+        (address.interface_index(), address.subinterface_index()),
+        (17, 3)
+    );
+    let general = injection_address(None);
+    assert!(general.outbound());
+    assert!(ReplyInterface::captured(&general).is_none());
+}
+
 fn stats() -> Stats {
     Stats::new(Arc::new(StatusBus::new()))
 }
@@ -346,6 +555,7 @@ async fn dropping_udp_flow_aborts_worker_and_releases_socket() {
         app_endpoint: (Ipv4Addr::LOCALHOST, 40000),
         original_dst: (Ipv4Addr::LOCALHOST, dst.port()),
         dns: None,
+        reply_interface: None,
         app_to_remote: tx,
         remote_to_app: rx,
         last_active: Instant::now(),
@@ -387,6 +597,7 @@ fn pending_flow(sockets: &mut SocketSet<'static>, since: Instant) -> (TcpKey, Tc
             creation_time: 0,
             original_dst: "127.0.0.1:443".parse().unwrap(),
             dns: None,
+            reply_interface: None,
             state: TcpState::Pending { since },
             task: None,
         },
@@ -570,6 +781,7 @@ fn tcp_request(port: u16, initial_syn: bool) -> TcpRequest {
         destination: SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 443),
         initial_syn,
         dns: None,
+        reply_interface: None,
     }
 }
 
@@ -663,6 +875,7 @@ async fn udp_capacity_rejects_new_worker_and_keeps_existing_flow() {
         creation_time: 0,
         target: None,
         dns: None,
+        reply_interface: None,
     };
     assert!(ensure_udp_flow(&mut flows, request(40000), &runtime, &stats, 1).is_some());
     assert!(ensure_udp_flow(&mut flows, request(40001), &runtime, &stats, 1).is_none());

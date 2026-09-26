@@ -24,6 +24,9 @@ pub enum Fault {
     UnavailableSession,
     UnsupportedTransport,
     InvalidPacket,
+    InjectionFailed,
+    FlowRejected,
+    QueueUnavailable,
     Revoked,
 }
 
@@ -36,6 +39,9 @@ impl Fault {
             Self::UnavailableSession => "unavailable_session",
             Self::UnsupportedTransport => "unsupported_transport",
             Self::InvalidPacket => "invalid_packet",
+            Self::InjectionFailed => "injection_failed",
+            Self::FlowRejected => "flow_rejected",
+            Self::QueueUnavailable => "queue_unavailable",
             Self::Revoked => "revoked",
         }
     }
@@ -47,6 +53,7 @@ pub struct Lease {
     pub creation_time: u64,
     pub exe_path: String,
     pub dns: DnsSession,
+    pub control_revision: u64,
 }
 
 pub enum Decision {
@@ -64,6 +71,7 @@ pub struct LiveAuthority {
     session: SessionSource,
     vpn: VpnState,
     shutdown: Shutdown,
+    control: crate::dns_control::ControlSource,
 }
 
 impl LiveAuthority {
@@ -72,12 +80,14 @@ impl LiveAuthority {
         session: SessionSource,
         vpn: VpnState,
         shutdown: Shutdown,
+        control: crate::dns_control::ControlSource,
     ) -> Self {
         Self {
             resolver,
             session,
             vpn,
             shutdown,
+            control,
         }
     }
 
@@ -88,17 +98,44 @@ impl LiveAuthority {
         let dns = self.session.current_dns().ok()??;
         (vpn_state::current(&self.vpn) == Some(dns.target)).then_some(dns)
     }
+
+    pub fn control_state(&self) -> crate::dns_control::Acknowledgement {
+        self.control.current()
+    }
+
+    pub fn poll_control(
+        &self,
+        dns: Option<&DnsSession>,
+        cleanup: impl FnOnce(),
+    ) -> crate::dns_control::Acknowledgement {
+        self.control.poll(dns, &self.resolver, cleanup)
+    }
 }
 
 impl Authority for LiveAuthority {
     fn decide(&self, owner: OwnerLookup) -> Decision {
-        decide_with(
+        let applied = self.control.current();
+        if !applied.armed {
+            return Decision::Pass;
+        }
+        let result = decide_with(
             owner,
             std::process::id(),
             |pid| self.resolver.resolve(pid),
             crate::tunneled::load_from_disk,
-            || self.ready_session(),
-        )
+            || self.ready_session().filter(|dns| applied.permits(dns)),
+        );
+        let now = self.control.current();
+        if !now.armed || now.revision != applied.revision {
+            return Decision::Drop(Fault::Revoked);
+        }
+        match result {
+            Decision::Tunnel(mut lease) => {
+                lease.control_revision = applied.revision;
+                Decision::Tunnel(lease)
+            }
+            other => other,
+        }
     }
 }
 
@@ -116,6 +153,9 @@ fn decide_with(
         OwnerLookup::Ambiguous => return Decision::Drop(Fault::AmbiguousOwner),
     };
     let Some(process) = resolve(pid) else {
+        if crate::dns_broker::trace::allow(crate::dns_broker::trace::Category::Ownership) {
+            tracing::warn!(pid, "split DNS owner process identity unavailable");
+        }
         return Decision::Drop(Fault::UnknownOwner);
     };
     // Read synchronously: a newly selected application must not use the
@@ -135,6 +175,7 @@ fn decide_with(
         creation_time: process.creation_time,
         exe_path: process.exe_path,
         dns,
+        control_revision: 0,
     })
 }
 

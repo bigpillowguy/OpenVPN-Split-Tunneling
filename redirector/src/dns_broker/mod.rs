@@ -2,6 +2,7 @@
 //! The UI does not start it; Windows VPN Platform integration is still research.
 //! No system resolver API, system cache, public resolver, or unbound fallback.
 mod security;
+pub(crate) mod trace;
 pub(crate) mod transport;
 pub(crate) mod wire;
 
