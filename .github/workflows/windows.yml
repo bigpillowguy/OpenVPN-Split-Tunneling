@@ -41,6 +41,8 @@ jobs:
           dotnet test dotnet/VpnClient.Tests/VpnClient.Tests.csproj -c Release --nologo --no-restore
       - name: Windows VPN Platform offline build and tests
         run: powershell -NoProfile -ExecutionPolicy Bypass -File research/VpnPlatform/build.ps1
+      - name: DNS diagnostic probe build and offline codec tests
+        run: ./research/DnsDiagnostics/Build.ps1 -RunCodecTests
       - name: DNS recovery state tests (no service changes)
         run: |
           dotnet restore dotnet/VpnClient.DnsGuard.Tests/VpnClient.DnsGuard.Tests.csproj --locked-mode
