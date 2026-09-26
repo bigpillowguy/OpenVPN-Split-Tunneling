@@ -19,6 +19,10 @@ pwsh -File .\research\DnsDiagnostics\Invoke-Probe.ps1 -DnsServer 192.168.1.1 -Qu
 # One bounded comparison at the next user-controlled activation (no automatic activation/restoration):
 pwsh -File .\research\DnsDiagnostics\Wait-ActiveProbe.ps1 -DnsServer 192.168.1.1 -WaitSeconds 180
 
+# When DNS failure can disconnect the operator, run this from a normal local
+# PowerShell window opened by the user, before enabling the experimental mode:
+pwsh -File .\research\DnsDiagnostics\Wait-ActiveProbe.ps1 -DnsServer 192.168.1.1 -WaitSeconds 900
+
 # Run the API modes only through a process supervisor with a deadline:
 DnsProbe.exe getaddrinfo browserleaks.com
 DnsProbe.exe dns-standard browserleaks.com
@@ -41,6 +45,23 @@ The watcher prints its UTC start/deadline and changes in the observed SCM/proces
 state. A process-metadata read failure is reported rather than silently treated
 as proof that the original DNS service is running.
 
+When the failure also disconnects the operator's chat, start the watcher from
+the user's ordinary local PowerShell/Explorer session. A tool-launched process
+can inherit Windows Jobs that terminate with its session; hiding a window or
+using `Start-Process` alone does not establish independence. An attempted Job
+breakaway in the diagnostic environment still left the child in a Job, and was
+rejected before the watcher started. The supported workflow therefore uses a
+manual local launch. It is a transient diagnostic process, not a scheduled task
+or installed service, and never toggles VPN or DNS services.
+
+Each watcher attempt writes `status.json` and `watch.log` in its own directory under
+`target/dns-diagnostics`. States include `waiting`, `measuring`, `complete`,
+`timeout`, and `failed`. A completed comparison also writes `probe.json` there.
+These files survive loss of the chat connection. Only after the local console
+prints its first service observation should the user enable the mode, leave it Active for
+20 seconds, and disable it again. The diagnostic operator reads the local files
+after communication recovers; a chat reply is not the trigger for the test.
+
 `TestCodec.cpp` compiles the production parser in a separate test executable. Its 12 offline checks cover positive A/CNAME answers, NODATA/NXDOMAIN, missing records, truncated CNAME data, alias cycles, trailing bytes, invalid A length, a mismatched question, and unrelated A records. It never invokes the probe CLI or a networking API. These checks validate decoding; they do not replace live socket/API comparisons.
 
 The raw resolver argument must be an IPv4 literal; the port is always 53. Zero, broadcast, multicast, and reserved high address ranges are rejected. Private and loopback resolvers are allowed when explicitly supplied. The source does not contain a public resolver fallback.
@@ -55,6 +76,8 @@ classifies both service snapshots as `observedStub`, `observedOff`, or
 Dnscache/guardian PIDs before and after the probes. `observedStub` means the stub
 and guardian were running at those two observations; it does not certify backend
 readiness, continuous state between snapshots, or successful DNS isolation.
+A failed service snapshot is recorded as unknown and does not discard completed
+probe results. Service queries have an operation timeout.
 
 | Field | Meaning |
 | --- | --- |

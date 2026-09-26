@@ -45,7 +45,8 @@ namespace VpnClient.DnsDiagnostics {
 }
 
 function Get-ProbeServiceState {
-    @(Get-CimInstance Win32_Service -Filter "Name='Dnscache' OR Name='VpnClientDnsGuard'" | ForEach-Object {
+    try {
+    @(Get-CimInstance Win32_Service -OperationTimeoutSec 2 -Filter "Name='Dnscache' OR Name='VpnClientDnsGuard'" -ErrorAction Stop | ForEach-Object {
         $service = $_
         $processName = $null
         if ($service.ProcessId -gt 0) {
@@ -58,6 +59,10 @@ function Get-ProbeServiceState {
         }
         [pscustomobject]@{ Name=$service.Name; State=$service.State; ProcessId=$service.ProcessId; ProcessName=$processName; ExitCode=$service.ExitCode }
     })
+    } catch {
+        # A failed metadata snapshot must not discard completed DNS results.
+        [pscustomobject]@{ Name='_observation'; State='Unknown'; ProcessId=0; ProcessName=$null; ExitCode=$null; Error=$_.Exception.GetType().Name }
+    }
 }
 
 function Get-ProbeServiceClassification([object[]]$Services) {
