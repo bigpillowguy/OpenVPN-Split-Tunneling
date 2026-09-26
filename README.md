@@ -68,6 +68,14 @@ choose a compatible driver. An old `windows-driver wintun` option is ignored by
 OpenVPN 2.7, rather than providing Wintun support. See the
 [OpenVPN 2.7.4 changes](https://github.com/OpenVPN/openvpn/blob/v2.7.4/Changes.rst).
 
+If the window reports **routing unavailable**, inspect the redirector failure
+and diagnostic path displayed below the connection state. Each launch keeps
+`redirector.log` under `%LOCALAPPDATA%\VpnClient\runtime\<launch-id>\` with one
+rotated `.1` archive (up to 2 MiB each). Logs survive normal client shutdown;
+the session binding and temporary profile containing keys are removed.
+Version 1.0.1 fixes a backend exit triggered by normal zero-payload WinDivert
+SOCKET events. Close the client and install 1.0.1 when upgrading from 1.0.0.
+
 Close this client's session before upgrading or uninstalling. Setup uses file
 ownership and Windows Restart Manager for in-use application files; it does not
 kill all `openvpn.exe` processes or delete a shared WinDivert service. A locked
@@ -158,7 +166,7 @@ The script enters the repository root, puts rustup before any older system Rust
 installation, checks MSVC, builds with `Cargo.lock`, publishes the UI, verifies
 NuGet dependencies against `packages.lock.json`, checks the WinDivert staging
 files, and compiles setup. It **never executes the setup**.
-The output is `installer/Output/VpnClientSetup-1.0.0.exe`.
+The output is `installer/Output/VpnClientSetup-1.0.1.exe`.
 
 The bundled OpenVPN download is pinned by SHA-256 and requires a valid OpenVPN
 Authenticode signature. Every cached use is checked; downloads are verified
@@ -192,7 +200,7 @@ and fail if the package graph disagrees with the committed lockfile.
 Windows CI is configured to check formatting, clippy and tests, and produce an
 unsigned installer artifact without installing OpenVPN or starting VPN/driver
 processes. Product/setup version
-`1.0.0` and internal Rust workspace crate version `0.1.0` are separate identifiers.
+`1.0.1` and internal Rust workspace crate version `0.1.0` are separate identifiers.
 
 ## Source layout and licenses
 
@@ -203,9 +211,10 @@ processes. Product/setup version
 | `ipc/` | Protobuf definitions and framing |
 | `installer/` | Build, prerequisite validation, setup, licenses |
 | `vendor/windivert/` | WinDivert 2.2.2 binaries and upstream license |
+| `vendor/windivert-rs/` | Patched Rust wrapper: metadata-only events and safe overlapped cancellation |
 | `supervisor/`, `ui/` | Experimental Rust tools |
 
-This repository's Rust and C# source is [MIT licensed](LICENSE). Third-party
+This project's own Rust and C# source is [MIT licensed](LICENSE). Third-party
 components retain their own licenses. Setup includes the client license,
 WinDivert's LGPLv3/GPL texts, and OpenVPN's GPLv2 text and linking exceptions
 under `licenses/`. See [third-party notices](installer/licenses/THIRD-PARTY-NOTICES.txt)

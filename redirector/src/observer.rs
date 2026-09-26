@@ -21,11 +21,6 @@ pub fn run(
     )?;
 
     tracing::info!("SOCKET observer started, filter: {}", filter);
-    println!(
-        "\n{:<3} {:<8} {:<6} {:<5} {:<46} {:<46} PROCESS",
-        "TUN", "EVENT", "PID", "PROTO", "LOCAL", "REMOTE"
-    );
-    println!("{}", "-".repeat(150));
 
     while !shutdown.is_stopped() {
         match handle.recv_wait(100) {
@@ -64,7 +59,9 @@ fn handle_event(
         _ => {}
     }
 
-    log_event(addr, resolver, policy_state, pid, event, proto);
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        log_event(addr, resolver, policy_state, pid, event, proto);
+    }
 }
 
 fn log_event(
@@ -99,9 +96,15 @@ fn log_event(
         ""
     };
 
-    println!(
+    tracing::debug!(
         "{:<3} {:<8} {:<6} {:<5} {:<46} {:<46} {}",
-        marker, event_str, pid, proto_s, local, remote, exe
+        marker,
+        event_str,
+        pid,
+        proto_s,
+        local,
+        remote,
+        exe
     );
 }
 

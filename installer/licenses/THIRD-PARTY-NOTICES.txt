@@ -10,6 +10,16 @@ license texts are in WinDivert-LICENSE.txt. These files are unmodified.
 Source and build instructions: https://github.com/basil00/WinDivert/tree/v2.2.2
 Upstream project: https://reqrypt.org/windivert.html
 
+windivert Rust wrapper 0.7.0-beta.4 (modified)
+Author: Ruben Serrano Izquierdo.
+License: LGPL-3.0-or-later; full text: windivert-rs-LICENSE.txt.
+Upstream source: https://github.com/Rubensei/windivert-rust
+Modified source and patch notes: vendor/windivert-rs/ in this client's repository.
+The local patch accepts metadata-only SOCKET/FLOW events and drains cancelled
+overlapped reads before releasing their memory. Build/relink instructions are
+in the client README and vendor/windivert-rs/README.md; Cargo.lock selects the
+local source via the workspace patch. The WinDivert DLL and SYS are unchanged.
+
 OpenVPN Community 2.7.4-I001 amd64
 Copyright (C) 2002-2026 OpenVPN Inc.
 The official MSI is bundled unchanged and installed separately as a prerequisite.

@@ -132,6 +132,75 @@ public class SessionBindingTests
         Assert.Throws<InvalidOperationException>(() => replacement.Publish(next));
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void DisposeRevokesSensitiveBindingButPreservesBackendDiagnostics(bool onlyRotatedLog)
+    {
+        var root = Path.Combine(Path.GetTempPath(), "vpn-binding-test-" + Guid.NewGuid().ToString("N"));
+        using var store = new VpnSessionBindingStore(root);
+        var directory = Path.GetDirectoryName(store.FilePath)!;
+        var logPath = Path.Combine(directory, "redirector.log");
+        var previousLogPath = logPath + ".1";
+        // A crash between rotate/rename and recreating the main log can leave only .1.
+        var retainedLogPath = onlyRotatedLog ? previousLogPath : logPath;
+        try
+        {
+            using var lease = store.Begin();
+            lease.Publish(Binding());
+            const string diagnostics = "backend startup failed; native error 6\n";
+            if (!onlyRotatedLog) File.WriteAllText(previousLogPath, "previous diagnostics");
+            // A backend may still hold its log while the UI closes the owned Job.
+            using (var log = new FileStream(retainedLogPath, FileMode.CreateNew, FileAccess.Write, FileShare.Read))
+            {
+                log.Write(System.Text.Encoding.UTF8.GetBytes(diagnostics));
+                log.Flush();
+                store.Dispose();
+                store.Dispose(); // Cleanup remains idempotent with retained diagnostics.
+                Assert.False(File.Exists(store.FilePath));
+                Assert.True(File.Exists(retainedLogPath));
+                Assert.True(Directory.Exists(directory));
+                Assert.Throws<ObjectDisposedException>(() => store.Begin());
+                Assert.Throws<InvalidOperationException>(() => lease.Publish(Binding()));
+            }
+            Assert.Equal(diagnostics, File.ReadAllText(retainedLogPath));
+            if (!onlyRotatedLog) Assert.Equal("previous diagnostics", File.ReadAllText(previousLogPath));
+        }
+        finally
+        {
+            store.Dispose();
+            File.Delete(logPath);
+            File.Delete(previousLogPath);
+            if (Directory.Exists(directory)) Directory.Delete(directory, recursive: false);
+            Directory.Delete(root, recursive: false);
+        }
+    }
+
+    [Fact]
+    public void DisposeWithoutDiagnosticsRemovesOnlyItsLaunchDirectory()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "vpn-binding-test-" + Guid.NewGuid().ToString("N"));
+        using var store = new VpnSessionBindingStore(root);
+        var directory = Path.GetDirectoryName(store.FilePath)!;
+        var unrelated = Path.Combine(root, "keep.txt");
+        try
+        {
+            File.WriteAllText(unrelated, "another session owns this file");
+            using var lease = store.Begin();
+            lease.Publish(Binding());
+            store.Dispose();
+            Assert.False(File.Exists(store.FilePath));
+            Assert.False(Directory.Exists(directory));
+            Assert.Equal("another session owns this file", File.ReadAllText(unrelated));
+        }
+        finally
+        {
+            store.Dispose();
+            File.Delete(unrelated);
+            Directory.Delete(root, recursive: false);
+        }
+    }
+
     [Fact]
     public void BindingCapturesNativeProcessIdentityAndPrivateAclWithoutLaunchingAnything()
     {

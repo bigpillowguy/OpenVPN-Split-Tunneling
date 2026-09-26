@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["redirector", "supervisor", "ipc", "ui"]
+members = ["redirector", "supervisor", "ipc", "ui", "vendor/windivert-rs"]
+
+[patch.crates-io]
+windivert = { path = "vendor/windivert-rs" }
 
 [workspace.package]
 edition = "2021"

@@ -81,7 +81,10 @@ internal sealed class VpnSessionBindingStore : IDisposable
             _disposed = true;
             _lease = Guid.Empty;
             File.Delete(FilePath);
-            Directory.Delete(_directory, recursive: false);
+            // Preserve backend diagnostics from this launch; only session.json is ephemeral.
+            try { Directory.Delete(_directory, recursive: false); }
+            catch (IOException) when (File.Exists(Path.Combine(_directory, "redirector.log")) ||
+                                      File.Exists(Path.Combine(_directory, "redirector.log.1"))) { }
         }
     }
 

@@ -23,6 +23,7 @@ public partial class MainWindow : FluentWindow
         _statusClient.SnapshotReceived += OnSnapshot;
         _statusClient.ConnectionChanged += OnConnectionChanged;
         App.Connector.StateChanged += OnVpnStateChanged;
+        Redirector.StateChanged += OnVpnStateChanged;
         Loaded += (_, _) => {
             _statusClient.Start();
             RefreshAppList();
@@ -31,7 +32,7 @@ public partial class MainWindow : FluentWindow
                 System.Windows.MessageBox.Show(warning, "Configuration recovery", MessageBoxButton.OK, MessageBoxImage.Warning);
         };
         Closing += OnClosing;
-        Closed += (_, _) => { _statusClient.Stop(); App.Connector.StateChanged -= OnVpnStateChanged; };
+        Closed += (_, _) => { _statusClient.Stop(); App.Connector.StateChanged -= OnVpnStateChanged; Redirector.StateChanged -= OnVpnStateChanged; };
     }
 
     private bool _redirectorConnected;
@@ -131,7 +132,7 @@ public partial class MainWindow : FluentWindow
         var connector = App.Connector;
         var busy = connector.State is VpnConnectionState.Connecting or VpnConnectionState.Disconnecting;
         var canStop = connector.HasSession || connector.State == VpnConnectionState.Connecting;
-        var ready = _redirectorConnected && _snapshot?.Vpn?.Up == true;
+        var ready = Redirector.IsRunning && _redirectorConnected && _snapshot?.Vpn?.Up == true;
         StateSpinner.Visibility = busy ? Visibility.Visible : Visibility.Collapsed;
         StateDot.Visibility = busy ? Visibility.Collapsed : Visibility.Visible;
         StateText.Text = connector.State switch
@@ -144,7 +145,7 @@ public partial class MainWindow : FluentWindow
         };
         StateDot.Fill = new SolidColorBrush(connector.State == VpnConnectionState.Connected && ready
             ? Color.FromRgb(0x10, 0xA1, 0x6B) : Color.FromRgb(0xC5, 0x72, 0x42));
-        AdapterText.Text = connector.LastError ?? (!_redirectorConnected ? "Redirector unavailable; you can still stop OpenVPN."
+        AdapterText.Text = connector.LastError ?? Redirector.Failure ?? (!_redirectorConnected ? "Redirector unavailable; you can still stop OpenVPN."
             : ready ? $"egress source {_snapshot!.Vpn.AdapterIp}" : "Waiting for a usable VPN route");
         AdapterText.TextWrapping = TextWrapping.Wrap;
         UptimeText.Text = connector.State == VpnConnectionState.Connected && ready ? FormatUptime(_snapshot!.Vpn.UptimeMs) : "—";

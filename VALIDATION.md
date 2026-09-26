@@ -18,14 +18,16 @@ dotnet restore dotnet/VpnClient.Tests/VpnClient.Tests.csproj --locked-mode
 dotnet test dotnet/VpnClient.Tests/VpnClient.Tests.csproj -c Release --nologo --no-restore
 ```
 
-- **Rust: 44 теста**, 0 ошибок (42 redirector, 2 IPC). fmt и строгий Clippy проходят.
-- **.NET: 110 тестов**, 0 ошибок и предупреждений. Тесты компилируют фактические невизуальные
+- **Rust: 76 тестов + 1 compile-only doctest**, 0 ошибок: 45 redirector,
+  2 IPC, 29 vendored windivert. fmt и строгий workspace Clippy проходят.
+- **.NET: 113 тестов**, 0 ошибок и предупреждений. Тесты компилируют фактические невизуальные
   production-исходники под net10.0-windows; UI отдельно собирается под net8.0.
 - WPF Release build: 0 ошибок и предупреждений. Self-contained publish проходит.
 - Оба NuGet lockfile сохранены; locked restore и publish/test с `--no-restore`
   проходят. CI использует те же проверки и отменяет устаревший запуск этой ветки.
 - `installer/build.ps1` успешно вызван абсолютным путём из `%TEMP%` через Windows
-  PowerShell 5.1. Собран `installer/Output/VpnClientSetup-1.0.0.exe`.
+  PowerShell 5.1. Собран `installer/Output/VpnClientSetup-1.0.1.exe`;
+  версия UI и установщика согласована: 1.0.1.
 - `installer/test-dependencies.ps1` проверяет features закреплённого подписанного
   MSI, валидный кеш, замену повреждённого кеша, отказ на битой загрузке и cleanup.
   Предупреждения о повреждённом кеше в этом тесте ожидаемы.
@@ -47,6 +49,7 @@ dotnet test dotnet/VpnClient.Tests/VpnClient.Tests.csproj -c Release --nologo --
 | SEC-01/02 | Уникальные сессионные секреты, чтение и удаление файла; management prompt без newline, отказ неверного пароля, отмена молчащего peer, escaping credentials. Реальный OpenVPN не запускался. |
 | SEC-03/04/05/06 | Production policy server отключён; status ACL создаётся для текущего пользователя/SYSTEM. .NET валидирует диапазоны, адреса, дубликаты PID/paths и бюджеты snapshots. Stalled writer получает timeout. Проверка server PID реализована; межпользовательский и массовый IPC acceptance ещё не выполнены. |
 | UI-01/09 | Job создаётся до children, kernel JOB_LIST назначается при CreateProcess, thread возобновляется после получения handles. Проверяется Windows argument quoting; запуск реальных children и отказ Job assignment остаются ручной/VM проверкой. |
+| WinDivert recv_wait | Mock проверяет SOCKET/FLOW с нулём payload, сохранение metadata, malformed native lengths и native error. Три native named-pipe tests проверяют адрес OVERLAPPED, отмену только выбранного запроса, завершение до освобождения памяти и сохранение успешной гонки; драйвер не загружается. |
 
 ## Второй пакет: маршруты/DNS, импорт и адаптер
 
@@ -88,6 +91,47 @@ Pull filters сами по себе не являются защитой от в
 
 ## Что обязательно проверить перед стабильным релизом
 
+### Инцидент на установленной 1.0.0 и патч 1.0.1
+
+Пользователь установил 1.0.0 на текущем ПК и получил `VPN connected — routing
+unavailable`. При чтении состояния OpenVPN работал, redirector отсутствовал,
+WinDivert был загружен; установленный backend совпадал с предыдущим build.
+Привязка сессии указывала на действующий DCO adapter и совпадающие IP/index/GUID.
+Чтение списка адаптеров установленным redirector и компиляция фильтров DLL
+проходили. Это не проверка передачи данных через capture.
+
+Найден дефект в `windivert 0.7.0-beta.4`: `recv_wait` превращал успешный приём
+SOCKET event с нулём payload bytes в `NoData`. SOCKET/FLOW содержат metadata,
+а не IP packet; это описано в
+[WinDivertRecv](https://reqrypt.org/windivert-doc.html#divert_recv) и подтверждается
+завершением read с `read_len = 0` в
+[WinDivert 2.2.2 driver](https://github.com/basil00/WinDivert/blob/v2.2.2/sys/windivert.c).
+Observer считал этот результат постоянной ошибкой и останавливал backend.
+Изначальные тесты не покрывали контракт этой зависимости — успешная сборка и
+проверки обработки пакетов не обнаружили такой ранний выход.
+
+В workspace включена локальная копия wrapper с upstream provenance и лицензией.
+Патч принимает нулевой payload для metadata-only events и проверяет native lengths.
+Отмена timeout теперь использует `CancelIoEx` для конкретного запроса и ждёт
+окончательного `GetOverlappedResult`, прежде чем освобождать OVERLAPPED/buffers.
+OVERLAPPED хранится по стабильному адресу; успешно завершившийся запрос при
+гонке с timeout возвращается вызывающему коду.
+
+Backend сохраняет цепочки ошибок и panic/backtrace в частный `redirector.log`
+(2 MiB + один архив `.1`). События сокетов пишутся только при DEBUG. UI наблюдает
+выход процесса, показывает код/путь и не объявляет мёртвый backend готовым.
+Файловые регрессии проверяют удаление session.json с сохранением открытого лога
+и cleanup каталога без логов. Native child с CREATE_NO_WINDOW проверяет ожидание
+настоящего named event и запись panic без драйвера; предполагаемый отказ console
+handler на этом ПК не воспроизведён и не считается причиной инцидента.
+
+Установщик 1.0.1 предназначен для повторной проверки на ПК пользователя. До
+обновления и нового подключения нельзя считать восстановление маршрутизации
+подтверждённым. Во время диагностики агент не отключал VPN, не запускал capture
+и не менял системные маршруты.
+
+### Оставшаяся приёмка
+
 1. Чистые Windows 10/11 x64: установка, обновление, удаление, MSI errors/reboot,
    соседний независимый OpenVPN и занятый драйвер.
 2. Настоящий VPN: большие передачи с контрольной суммой, низкие скорости, оба
@@ -99,8 +143,9 @@ Pull filters сами по себе не являются защитой от в
    переноса исходной папки, два VPN, same-IP reconnect, DCO/TAP и delayed readiness.
 5. ENG/PROD: IPv6, полный TCP tuple, reinjection, MTU/fragmentation и fail-open.
 
-Установщик собран, но не запускался; VPN/WinDivert capture и системные маршруты
-в этой проверке не менялись.
+Агент выполнял сборку без запуска установщика. Установку 1.0.0 и подключение
+выполнил пользователь; read-only диагностика инцидента описана выше. Во время
+автоматических проверок VPN/WinDivert capture и системные маршруты не менялись.
 GitHub Actions на commit `63df232` прошёл после закрепления SDK:
 [run 36237661483](https://github.com/bigpillowguy/OpenVPN-Split-Tunneling/actions/runs/36237661483).
 Результат CI для нового пакета учитывается отдельно от этого запуска и локальных тестов.

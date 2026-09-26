@@ -1,4 +1,5 @@
 mod adapter;
+mod diagnostics;
 mod divert;
 mod flows;
 mod observer;
@@ -18,15 +19,26 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
+fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().collect();
+    // Initialize the supplied diagnostic path before validating the remaining
+    // arguments, so even startup/usage failures survive a CREATE_NO_WINDOW launch.
+    let log_path = args
+        .windows(2)
+        .find_map(|pair| (pair[0] == "--log-file").then(|| std::path::Path::new(&pair[1])));
+    let result = diagnostics::init(log_path).and_then(|()| dispatch(&args));
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            tracing::error!("backend terminated: {error:#}");
+            use std::io::Write;
+            let _ = writeln!(std::io::stderr(), "backend terminated: {error:#}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn dispatch(args: &[String]) -> Result<()> {
     match args.get(1).map(|s| s.as_str()) {
         None | Some("adapters") => print_adapters(),
         Some("observe") => run_observe(observe_options(&args[2..])?),
@@ -37,7 +49,7 @@ fn main() -> Result<()> {
         Some(cmd) => {
             eprintln!("unknown command: {}", cmd);
             print_help();
-            std::process::exit(2);
+            anyhow::bail!("unknown command: {cmd}")
         }
     }
 }
@@ -50,6 +62,7 @@ struct ObserveOptions<'a> {
 fn observe_options(args: &[String]) -> Result<ObserveOptions<'_>> {
     let mut shutdown_event = None;
     let mut session_file = None;
+    let mut seen_log_file = false;
     for pair in args.chunks(2) {
         match pair {
             [flag, value] if flag == "--shutdown-event" && shutdown_event.is_none() => {
@@ -58,8 +71,12 @@ fn observe_options(args: &[String]) -> Result<ObserveOptions<'_>> {
             [flag, value] if flag == "--session-file" && session_file.is_none() => {
                 session_file = Some(std::path::Path::new(value));
             }
+            [flag, value] if flag == "--log-file" && !seen_log_file => {
+                anyhow::ensure!(std::path::Path::new(value).is_absolute(), "--log-file must be an absolute path");
+                seen_log_file = true;
+            }
             _ => anyhow::bail!(
-                "usage: redirector observe --session-file PATH [--shutdown-event NAME]"
+                "usage: redirector observe --session-file PATH [--shutdown-event NAME] [--log-file PATH]"
             ),
         }
     }
@@ -72,6 +89,7 @@ fn observe_options(args: &[String]) -> Result<ObserveOptions<'_>> {
 }
 
 fn run_observe(options: ObserveOptions<'_>) -> Result<()> {
+    tracing::info!("backend starting, version={}", env!("CARGO_PKG_VERSION"));
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -135,16 +153,14 @@ fn run_observe(options: ObserveOptions<'_>) -> Result<()> {
             });
         };
 
-        let stop = async {
-            tokio::select! {
-                r = tokio::signal::ctrl_c() => r.context("console shutdown signal"),
-                r = external_stop.wait() => r,
-            }
-        };
+        let stop = external_stop.wait_for_request();
         supervise(services, workers, shutdown, stop).await
     });
     // A broken native API must not make Runtime::drop wait forever.
     rt.shutdown_timeout(std::time::Duration::from_secs(1));
+    if result.is_ok() {
+        tracing::info!("backend shutdown completed");
+    }
     result
 }
 
@@ -194,7 +210,7 @@ fn print_help() {
     println!();
     println!("USAGE:");
     println!("  redirector [adapters]    List network adapters, flag VPN candidates");
-    println!("  redirector observe --session-file PATH [--shutdown-event NAME]");
+    println!("  redirector observe --session-file PATH [--shutdown-event NAME] [--log-file PATH]");
     println!(
         "                          Run routing for the UI's bound VPN session (requires admin)"
     );
@@ -266,6 +282,17 @@ mod lifecycle_tests {
         let duplicate = ["--session-file", "one", "--session-file", "two"].map(str::to_owned);
         assert!(observe_options(&duplicate).is_err());
         assert!(observe_options(&["--session-file".into()]).is_err());
+        let logged = [
+            "--session-file",
+            "C:\\private\\session.json",
+            "--log-file",
+            "C:\\private\\redirector.log",
+        ]
+        .map(str::to_owned);
+        assert!(observe_options(&logged).is_ok());
+        let mut duplicated_log = logged.to_vec();
+        duplicated_log.extend(["--log-file".into(), "C:\\private\\another.log".into()]);
+        assert!(observe_options(&duplicated_log).is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
