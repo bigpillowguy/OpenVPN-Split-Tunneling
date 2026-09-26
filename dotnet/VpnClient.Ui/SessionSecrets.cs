@@ -49,6 +49,9 @@ public sealed class SessionSecrets : IDisposable
             if (!Guid.TryParseExact(directory.Name, "N", out _) || (directory.Attributes & FileAttributes.ReparsePoint) != 0) continue;
             var secret = Path.Combine(directory.FullName, "management.secret");
             if (File.Exists(secret)) File.Delete(secret);
+            // Runtime profiles can contain inline private keys. Retain only diagnostic logs.
+            var profile = Path.Combine(directory.FullName, "runtime.ovpn");
+            if (File.Exists(profile)) File.Delete(profile);
         }
     }
 
@@ -61,6 +64,8 @@ public sealed class SessionSecrets : IDisposable
     public void Dispose()
     {
         ReleasePasswordFile();
+        var profile = Path.Combine(DirectoryPath, "runtime.ovpn");
+        if (File.Exists(profile)) File.Delete(profile);
         TryRemoveDirectory();
     }
 

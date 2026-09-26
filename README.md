@@ -18,15 +18,20 @@ profile and any credentials required by your provider.
   physical interface.
 - The client is **fail-open**: when the VPN is unavailable, selected applications
   may use the default route. This is not a kill switch or an anonymity boundary.
-- There is no per-application DNS isolation guarantee. Windows DNS Client,
-  application-managed DNS and DoH may take different routes.
-- The client filters common pushed full-tunnel directives. Local profile routes
-  and other pushed settings still need explicit policy handling (TODO UI-03).
-  OpenVPN manages its interface and connection routes; the redirector prepares an interface
-  route through the Windows routing API. VPN readiness requires that preparation
-  to succeed. Cleanup targets only the exact route created by this redirector.
-  Do not assume the system route table is unchanged. Review any routes and
-  executable hooks in a supplied profile.
+- **DNS stays with Windows.** Local and server-pushed DNS/DHCP settings are
+  excluded from the runtime profile. There is no per-application DNS isolation:
+  Windows DNS Client, application-managed DNS and DoH may take different routes.
+  Private VPN-only hostnames may not resolve with the system DNS servers.
+- Each connection uses a temporary profile that suppresses local/pushed routes,
+  including `redirect-gateway` and IPv4 `/1` routes. The stored profile is preserved.
+  OpenVPN still configures its tunnel interface; the redirector prepares a route
+  through that interface with the session's reported gateway. Readiness requires
+  that preparation to succeed. Cleanup removes only an unchanged route created
+  by this redirector. Interface configuration can still create connected routes.
+- The target is the interface reported by this client's OpenVPN process, checked
+  against its process creation time, interface GUID/index and assigned IPv4 address.
+  Other active VPN adapters are not selected as a fallback. Reconnects revoke old
+  flows even when the new interface address and index are unchanged.
 - An application's existing connections may need to reconnect when policy or
   VPN state changes. Select apps before starting their network activity.
 - Anti-cheat compatibility, packet reinjection behavior across Windows versions,
@@ -52,7 +57,9 @@ Administrator rights are required for installation and application launch.
    OpenVPN Community 2.7.4-I001 prerequisite. Setup reports MSI failures and
    requests a reboot when required.
 3. Launch the client, import a trusted profile through VPN settings, and enter
-   credentials if required. Stored credentials use Windows DPAPI for the user.
+   credentials if required. Supported external certificates and keys are copied
+   into a private folder with the profile. Stored credentials use Windows DPAPI
+   for the user.
 4. Add executable paths under **Manage**, then connect and start the selected
    applications. The main window displays VPN state and traffic statistics.
 
@@ -67,11 +74,29 @@ kill all `openvpn.exe` processes or delete a shared WinDivert service. A locked
 driver may require a restart. OpenVPN is a separate installed prerequisite and
 is not removed when this client is uninstalled.
 
+### Profile import
+
+The importer reads quoted paths and inline blocks, expands nested `config`
+files, and copies `ca`, `cert`, `key`, `pkcs12`, `tls-auth`, `tls-crypt`,
+`tls-crypt-v2`, `extra-certs`, `crl-verify` files and `dh` dependencies.
+Relative paths, including paths inside nested configs, are resolved from the
+top-level source profile's directory. Missing files, include cycles, unsupported
+directives and oversized inputs are reported before a profile is saved.
+
+Executable hooks/plugins, management overrides, `cd`/`chroot`, external password
+files and inline username/password blocks are unsupported. For username/password
+authentication use a bare `auth-user-pass` directive and save credentials in the
+UI. Encrypted private-key prompts and MFA/challenges remain unsupported.
+Imports use a separate directory per profile, so equal filenames do not overwrite
+another profile. Imported material is private to the current Windows user;
+temporary runtime profiles containing inline keys are removed at session cleanup.
+
 ## Architecture
 
 ```text
 WPF UI (elevated)
-  |-- OpenVPN process ------------ VPN interface / connection routes
+  |-- OpenVPN process ------------ VPN interface configuration
+  |-- private session binding ---- process identity + interface + gateway
   |-- redirector process --------- WinDivert + smoltcp + bridge sockets
   |-- config.json ---------------- selected executable paths
   `-- status named pipe <--------- VPN and application statistics
@@ -95,6 +120,14 @@ admitted under an old selection rather than retaining stale PID membership.
 TCP streams terminate in smoltcp and bridge to a new Windows socket; UDP uses
 per-flow bridge sockets. `IP_UNICAST_IF` binds those sockets to a VPN interface.
 
+OpenVPN 2.7's authenticated `management-up-down` events provide the interface
+index and gateway. The UI publishes them only after a matching `CONNECTED` event,
+and revokes the binding on reconnect, disconnect or process exit. The redirector
+requires this binding (`observe --session-file <path>`) and revalidates it every
+250 ms. `route-noexec` and `route-nopull` enforce the route/DNS policy; a nonexecuted
+route supplies OpenVPN's gateway metadata. See the
+[OpenVPN 2.7 manual](https://openvpn.net/community-docs/community-articles/openvpn-2-7-manual.html).
+
 `supervisor/` is an experimental command-line launcher, not part of the WPF
 workflow or installer. Rust `ui/` is a placeholder. Messages declared in the
 protobuf schema do not imply that every command/event is implemented.
@@ -109,7 +142,8 @@ Use native x64 Windows with:
   but older toolchains are not part of this project's supported build baseline.
 - Visual Studio Build Tools with **Desktop development with C++**, MSVC x64/x86
   tools and a Windows SDK. The GNU Rust toolchain is not supported here.
-- .NET SDK **10.0.400** or its servicing patches, selected by `global.json`.
+- .NET SDK **10.0.400**, selected exactly by `global.json` so servicing SDKs cannot
+  silently change the implicit packages required by the committed lockfile.
   The application targets .NET 8 and ships its runtime in the self-contained
   publish output; no separate .NET installation is required on the target PC.
 - Inno Setup **6.7 or newer** for installer packaging.

@@ -1,0 +1,104 @@
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Security.AccessControl;
+using System.Security.Principal;
+using System.Text.Json;
+
+namespace VpnClient.Ui;
+
+internal sealed record VpnSessionBinding(int Version, Guid SessionId, uint OpenVpnPid, ulong OpenVpnCreationTime,
+    string OpenVpnExePath, Guid AdapterGuid, uint InterfaceIndex, string Ipv4, string Gateway);
+
+/// <summary>One private launch file; a lease prevents late callbacks from replacing a newer session.</summary>
+internal sealed class VpnSessionBindingStore : IDisposable
+{
+    private readonly object _gate = new();
+    private readonly string _directory;
+    private Guid _lease;
+    private bool _disposed;
+    private static readonly JsonSerializerOptions Json = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+    public string FilePath { get; }
+
+    public VpnSessionBindingStore(string? root = null)
+    {
+        root ??= SessionSecrets.RuntimeDirectory;
+        Directory.CreateDirectory(root);
+        _directory = Path.Combine(root, Guid.NewGuid().ToString("N"));
+        var security = new DirectorySecurity();
+        security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+        security.AddAccessRule(new FileSystemAccessRule(WindowsIdentity.GetCurrent().User!, FileSystemRights.FullControl,
+            InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
+        new DirectoryInfo(_directory).Create(security);
+        FilePath = Path.Combine(_directory, "session.json");
+    }
+
+    public Lease Begin()
+    {
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            File.Delete(FilePath);
+            _lease = Guid.NewGuid();
+            return new(this, _lease);
+        }
+    }
+
+    private void Publish(Guid lease, VpnSessionBinding binding)
+    {
+        lock (_gate)
+        {
+            if (_disposed || lease != _lease) throw new InvalidOperationException("The VPN session binding lease expired.");
+            var temporary = Path.Combine(_directory, Guid.NewGuid().ToString("N") + ".tmp");
+            try
+            {
+                using (var file = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                {
+                    JsonSerializer.Serialize(file, binding, Json);
+                    file.Flush(flushToDisk: true);
+                }
+                File.Move(temporary, FilePath, overwrite: true);
+            }
+            finally { File.Delete(temporary); }
+        }
+    }
+
+    private void Revoke(Guid lease, bool release)
+    {
+        lock (_gate)
+        {
+            if (_disposed || lease != _lease) return;
+            if (release) _lease = Guid.Empty;
+            File.Delete(FilePath);
+        }
+    }
+
+    public void Dispose()
+    {
+        lock (_gate)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            _lease = Guid.Empty;
+            File.Delete(FilePath);
+            Directory.Delete(_directory, recursive: false);
+        }
+    }
+
+    internal sealed class Lease : IDisposable
+    {
+        private readonly VpnSessionBindingStore _store;
+        private readonly Guid _id;
+        internal Lease(VpnSessionBindingStore store, Guid id) { _store = store; _id = id; }
+        public void Publish(Process process, OpenVpnTunnel tunnel, VpnAdapter adapter)
+        {
+            if (process.HasExited) throw new InvalidOperationException("OpenVPN exited before its tunnel was ready.");
+            var executable = process.MainModule?.FileName ?? throw new InvalidOperationException("Cannot verify the OpenVPN executable.");
+            Publish(new(1, tunnel.SessionId, checked((uint)process.Id), checked((ulong)process.StartTime.ToFileTimeUtc()),
+                Path.GetFullPath(executable), adapter.Guid, adapter.Index, tunnel.Ipv4.ToString(), tunnel.Gateway.ToString()));
+        }
+        internal void Publish(VpnSessionBinding binding) => _store.Publish(_id, binding);
+        public void Revoke() => _store.Revoke(_id, release: false);
+        public void Dispose() => _store.Revoke(_id, release: true);
+    }
+}

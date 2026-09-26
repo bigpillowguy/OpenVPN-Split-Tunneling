@@ -1,4 +1,4 @@
-# Первый пакет: результаты и границы проверки
+# Результаты и границы проверки
 
 26 сентября 2026, ветка `codex/first-stability-fixes`. Исходная точка ревью:
 `5f6273d22d29233699175935b5b3516c84383100`. [REVIEW.md](REVIEW.md) описывает эту
@@ -18,8 +18,8 @@ dotnet restore dotnet/VpnClient.Tests/VpnClient.Tests.csproj --locked-mode
 dotnet test dotnet/VpnClient.Tests/VpnClient.Tests.csproj -c Release --nologo --no-restore
 ```
 
-- **Rust: 33 теста**, 0 ошибок (31 redirector, 2 IPC). fmt и Clippy проходят.
-- **.NET: 35 тестов**, 0 ошибок. Тесты компилируют фактические невизуальные
+- **Rust: 44 теста**, 0 ошибок (42 redirector, 2 IPC). fmt и строгий Clippy проходят.
+- **.NET: 110 тестов**, 0 ошибок и предупреждений. Тесты компилируют фактические невизуальные
   production-исходники под net10.0-windows; UI отдельно собирается под net8.0.
 - WPF Release build: 0 ошибок и предупреждений. Self-contained publish проходит.
 - Оба NuGet lockfile сохранены; locked restore и publish/test с `--no-restore`
@@ -43,10 +43,33 @@ dotnet test dotnet/VpnClient.Tests/VpnClient.Tests.csproj -c Release --nologo --
 | CORE-10/13 | `main.rs` проверяет, что ошибка IPC-компонента сигналит и дожидается blocking worker; штатный stop дожидается cleanup. Receive loops имеют timeout и передают ошибки координатору. Настоящий отказ WinDivert не инъецировался. |
 | UI-02/11 | `SessionControllerTests.cs`: отмена handshake, последовательная замена, timeout/retry, сохранение ownership при ошибке stop, старые события и race CONNECTED/RECONNECTING. Используются fake sessions. |
 | UI-04/08/10 | `ConfigTests.cs`: дубликаты путей, backup recovery, сохранение повреждённого файла, отказ перезаписи неисправимого config, неудачная замена, одновременные читатели и dev discovery. Транзитные IO errors допускаются; backend сохраняет последний валидный список. Disk-full/crash ещё требуют стенда. |
-| UI-05/12 | Простые auth-user-pass/certificate-only profiles, whitespace и безопасная миграция host:port без обрезания IPv6. Include, external dependencies и сложная auth-модель не покрыты. |
+| UI-05/12 | Простые auth-user-pass/certificate-only profiles, whitespace и безопасная миграция host:port без обрезания IPv6. Во втором пакете добавлены quoting/includes/external dependencies; сложная auth-модель остаётся открытой. |
 | SEC-01/02 | Уникальные сессионные секреты, чтение и удаление файла; management prompt без newline, отказ неверного пароля, отмена молчащего peer, escaping credentials. Реальный OpenVPN не запускался. |
 | SEC-03/04/05/06 | Production policy server отключён; status ACL создаётся для текущего пользователя/SYSTEM. .NET валидирует диапазоны, адреса, дубликаты PID/paths и бюджеты snapshots. Stalled writer получает timeout. Проверка server PID реализована; межпользовательский и массовый IPC acceptance ещё не выполнены. |
 | UI-01/09 | Job создаётся до children, kernel JOB_LIST назначается при CreateProcess, thread возобновляется после получения handles. Проверяется Windows argument quoting; запуск реальных children и отказ Job assignment остаются ручной/VM проверкой. |
+
+## Второй пакет: маршруты/DNS, импорт и адаптер
+
+| Изменения | Проверка и ограничения |
+| --- | --- |
+| UI-03 | `RuntimeProfileTests.cs`: local redirect-gateway/redirect-private, обе IPv4 `/1`, IPv6 route, legacy dhcp-option и OpenVPN 2.7 dns исключаются; route-noexec/route-nopull обязательны. Managed pull filters стоят перед пользовательским accept-all; inline key и connection blocks сохранены, исходный файл не меняется. Для gateway metadata добавлен один неисполняемый route. Поведение PUSH_REPLY опирается на permission mask OpenVPN 2.7; реальный OpenVPN здесь не запускался. |
+| UI-06 | `ProfileImportTests.cs`: десять типов зависимостей, пути с пробелами, бинарные файлы, inline blocks, root-relative nested configs, перенос исходной папки, совпадающие имена, отсутствующие файлы/циклы/лимиты. Частные ACL и rollback до Commit проверяются файловыми тестами. Device namespaces (включая slash aliases), ADS и drive-relative paths отклоняются. Delete сохраняет legacy/external/unowned files и каталог с неожиданными файлами. |
+| CORE-15, .NET | `SessionBindingTests.cs`: native UP/ENV/CONNECTED metadata, чужой адаптер с тем же IP, GUID/index, malformed/duplicate environment, subnet mask не становится gateway. Lease не позволяет старым callback публиковать или удалять новую сессию. JSON содержит точный native FILETIME текущего процесса; ACL проверены. Windows adapter inventory только читается. |
+| CORE-15, Rust | `session_binding/tests.rs`: схема JSON, PID generation/exe mismatch, GUID/index/up/IP, missing/malformed/oversized snapshot, новый sessionId при прежних IP/index. `vpn_state.rs`: gateway/LUID берутся из привязки даже без предварительных route rows; чужой gateway не считается готовым, cleanup точный. `divert_tests.rs`: смена generation удаляет старые flows. |
+| Readiness/cleanup | UI принимает assigned IPv4 в состоянии Tentative для идентификации, Rust допускает только Preferred перед созданием маршрута/forwarding. Это сохраняет обработку DOWN без ожидания DAD внутри management-reader. Runtime-файл с inline keys удаляется вместе с session secrets и при очистке старых сессий; лог может остаться. |
+
+DNS-модель: профиль и сервер не меняют настройки DNS; используется системный resolver.
+Это не DNS-изоляция по приложениям и не гарантия разрешения VPN-only имён.
+OpenVPN продолжает конфигурировать tunnel interface, а Windows может добавлять
+connected routes. Нативные операции добавления/удаления маршрутов в тестах заменены
+fake RouteApi. Настоящие DCO/TAP, DHCP/adaptive timing, DNS и внешний IP остаются в QA-02.
+
+Политика сверена с upstream
+[OpenVPN 2.7 manual](https://openvpn.net/community-docs/community-articles/openvpn-2-7-manual.html),
+[pull_permission_mask/do_open_tun](https://github.com/OpenVPN/openvpn/blob/v2.7.4/src/openvpn/init.c)
+и [parser](https://github.com/OpenVPN/openvpn/blob/v2.7.4/src/openvpn/options_parse.c).
+`route-nopull` исключает OPT_P_ROUTE/OPT_P_DHCPDNS; route-gateway остаётся доступным.
+Pull filters сами по себе не являются защитой от вариантов whitespace в pushed options.
 
 ## Исправления, найденные при проверке этого пакета
 
@@ -59,6 +82,9 @@ dotnet test dotnet/VpnClient.Tests/VpnClient.Tests.csproj -c Release --nologo --
   Для этой гонки добавлена регрессия.
 - Build проверяет фактический Cargo compiler artifact, чтобы внешний target-dir
   не привёл к упаковке старого файла из `target/release`.
+- GitHub Actions первого пакета выявил расхождение implicit ILLink dependency:
+  latestPatch выбирал новый SDK с 8.0.31 вместо зафиксированного 8.0.30. `global.json`
+  теперь требует ровно SDK 10.0.400; обновление SDK и lockfile выполняется вместе.
 
 ## Что обязательно проверить перед стабильным релизом
 
@@ -68,9 +94,13 @@ dotnet test dotnet/VpnClient.Tests/VpnClient.Tests.csproj -c Release --nologo --
    порядка FIN/RST, port/PID reuse, тысячи UDP flows, переходы target и shutdown.
 3. Job/crash/forced kill, отказ драйвера, spoofed pipe, другой Windows user,
    много медленных IPC-клиентов, отсутствие доступа к файлам и заполненный диск.
-4. UI-03/06, CORE-15 и ENG/PROD из TODO: local/pushed routes, DNS, внешние зависимости
-   профиля, точная привязка адаптера, IPv6, full tuple, reinjection, MTU/fragmentation.
+4. Приёмка UI-03/06/CORE-15: local redirect-gateway + pushed `/1`/DNS, внешний IP
+   listed/unlisted apps, системный DNS/DoH, профиль с настоящими сертификатами после
+   переноса исходной папки, два VPN, same-IP reconnect, DCO/TAP и delayed readiness.
+5. ENG/PROD: IPv6, полный TCP tuple, reinjection, MTU/fragmentation и fail-open.
 
 Установщик собран, но не запускался; VPN/WinDivert capture и системные маршруты
 в этой проверке не менялись.
-CI добавлен в репозиторий; его результат учитывается отдельно от локальных тестов.
+GitHub Actions на commit `63df232` прошёл после закрепления SDK:
+[run 36237661483](https://github.com/bigpillowguy/OpenVPN-Split-Tunneling/actions/runs/36237661483).
+Результат CI для нового пакета учитывается отдельно от этого запуска и локальных тестов.

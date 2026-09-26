@@ -7,6 +7,7 @@ mod policy;
 // The unauthenticated policy pipe is intentionally not exposed by production.
 mod proc_watcher;
 mod process;
+mod session_binding;
 mod shutdown;
 mod stack;
 mod status_server;
@@ -28,14 +29,7 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
         None | Some("adapters") => print_adapters(),
-        Some("observe") => {
-            let shutdown_event = match args.get(2).map(String::as_str) {
-                None => None,
-                Some("--shutdown-event") if args.len() == 4 => Some(args[3].as_str()),
-                _ => anyhow::bail!("usage: redirector observe [--shutdown-event NAME]"),
-            };
-            run_observe(shutdown_event)
-        }
+        Some("observe") => run_observe(observe_options(&args[2..])?),
         Some("help") | Some("--help") | Some("-h") => {
             print_help();
             Ok(())
@@ -48,17 +42,47 @@ fn main() -> Result<()> {
     }
 }
 
-fn run_observe(shutdown_event: Option<&str>) -> Result<()> {
+struct ObserveOptions<'a> {
+    shutdown_event: Option<&'a str>,
+    session_file: &'a std::path::Path,
+}
+
+fn observe_options(args: &[String]) -> Result<ObserveOptions<'_>> {
+    let mut shutdown_event = None;
+    let mut session_file = None;
+    for pair in args.chunks(2) {
+        match pair {
+            [flag, value] if flag == "--shutdown-event" && shutdown_event.is_none() => {
+                shutdown_event = Some(value.as_str());
+            }
+            [flag, value] if flag == "--session-file" && session_file.is_none() => {
+                session_file = Some(std::path::Path::new(value));
+            }
+            _ => anyhow::bail!(
+                "usage: redirector observe --session-file PATH [--shutdown-event NAME]"
+            ),
+        }
+    }
+    Ok(ObserveOptions {
+        shutdown_event,
+        session_file: session_file.ok_or_else(|| {
+            anyhow::anyhow!("observe requires --session-file from the UI's current OpenVPN session")
+        })?,
+    })
+}
+
+fn run_observe(options: ObserveOptions<'_>) -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     let result = rt.block_on(async {
         use anyhow::Context;
         let shutdown = shutdown::Shutdown::new();
-        let external_stop = shutdown::ExternalStop::open(shutdown_event)?;
+        let external_stop = shutdown::ExternalStop::open(options.shutdown_event)?;
         let policy_state = policy::new();
         let flows = flows::new();
         let resolver = Arc::new(process::Resolver::new());
+        let session = session_binding::SessionSource::new(options.session_file, resolver.clone())?;
         let tunneled_paths = tunneled::new();
         // Do not start capture against a transiently empty policy.
         tunneled::replace(
@@ -75,6 +99,7 @@ fn run_observe(shutdown_event: Option<&str>) -> Result<()> {
             vpn_state.clone(),
             bus.clone(),
             shutdown.clone(),
+            session,
         ));
         services.spawn(status_server::run(bus.clone(), vpn_state.clone()));
         services.spawn(proc_watcher::run(
@@ -169,7 +194,10 @@ fn print_help() {
     println!();
     println!("USAGE:");
     println!("  redirector [adapters]    List network adapters, flag VPN candidates");
-    println!("  redirector observe       Run per-app routing + status pipe (requires admin)");
+    println!("  redirector observe --session-file PATH [--shutdown-event NAME]");
+    println!(
+        "                          Run routing for the UI's bound VPN session (requires admin)"
+    );
     println!("  redirector help          Show this message");
 }
 
@@ -221,6 +249,24 @@ mod lifecycle_tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn observe_requires_session_binding_and_rejects_ambiguous_options() {
+        assert!(observe_options(&[]).is_err());
+        let args = [
+            "--session-file",
+            "C:\\private\\session.json",
+            "--shutdown-event",
+            "Local\\VpnClient-test",
+        ]
+        .map(str::to_owned);
+        let options = observe_options(&args).unwrap();
+        assert_eq!(options.session_file, std::path::Path::new(&args[1]));
+        assert_eq!(options.shutdown_event, Some(args[3].as_str()));
+        let duplicate = ["--session-file", "one", "--session-file", "two"].map(str::to_owned);
+        assert!(observe_options(&duplicate).is_err());
+        assert!(observe_options(&["--session-file".into()]).is_err());
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn service_failure_stops_and_joins_blocking_capture() {

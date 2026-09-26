@@ -13,12 +13,13 @@ use windows::Win32::Networking::WinSock::{
     AF_INET, MIB_IPPROTO_NETMGMT, SOCKADDR_IN, SOCKADDR_INET,
 };
 
-use crate::adapter::{self, VpnTarget};
+use crate::adapter::VpnTarget;
+use crate::session_binding::SessionSource;
 use crate::shutdown::Shutdown;
 use crate::status_server::StatusBus;
 
 pub type VpnState = Arc<RwLock<Option<VpnTarget>>>;
-const POLL_INTERVAL: Duration = Duration::from_secs(2);
+const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const ROUTE_METRIC: u32 = 9999;
 
 pub fn new() -> VpnState {
@@ -182,30 +183,28 @@ impl<A: RouteApi> Routes<A> {
                 self.owned = None;
             }
         }
-        // An existing default is usable but must never become our property.
-        if rows
-            .iter()
-            .any(|row| row.index == target.if_index && row.is_default())
-        {
-            return Ok(Some(target));
-        }
-        let mut candidates = rows.iter().filter(|row| {
-            row.index == target.if_index
-                && !row.gateway.is_unspecified()
-                && !row.gateway.is_loopback()
-                && !row.gateway.is_multicast()
-                && row.gateway != target.ipv4
-        });
-        let peer = candidates.next().context("VPN peer route not ready yet")?;
-        if candidates.any(|row| row.gateway != peer.gateway || row.luid != peer.luid) {
-            bail!("ambiguous VPN peer routes");
-        }
         let route = Route {
+            luid: target.interface_luid,
+            index: target.if_index,
             destination: Ipv4Addr::UNSPECIFIED,
             prefix: 0,
+            gateway: target.gateway,
             metric: ROUTE_METRIC,
-            ..*peer
         };
+        // A foreign default on this interface could win route selection even
+        // for an interface-pinned socket. Do not publish ambiguous readiness.
+        if rows.iter().any(|row| {
+            row.index == target.if_index
+                && row.luid == target.interface_luid
+                && row.is_default()
+                && row.gateway != target.gateway
+        }) {
+            bail!("VPN interface has a default route outside its current session gateway");
+        }
+        // An exact existing default is usable, but never becomes our property.
+        if rows.iter().any(|row| row.same_key(&route)) {
+            return Ok(Some(target));
+        }
         if self.api.add(route)? {
             self.owned = Some(route);
         }
@@ -224,12 +223,28 @@ impl<A: RouteApi> Drop for Routes<A> {
     }
 }
 
-pub async fn watcher(state: VpnState, bus: Arc<StatusBus>, shutdown: Shutdown) -> Result<()> {
+pub async fn watcher(
+    state: VpnState,
+    bus: Arc<StatusBus>,
+    shutdown: Shutdown,
+    session: SessionSource,
+) -> Result<()> {
     let mut routes = Routes::new(WindowsRoutes);
     while !shutdown.is_stopped() {
-        let ready = match adapter::enumerate()
-            .and_then(|adapters| routes.reconcile(adapter::find_vpn_target(&adapters)))
-        {
+        let candidate = match session.current() {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                tracing::warn!(%error, "VPN session binding is not ready");
+                None
+            }
+        };
+        // Revoke the old generation before native route reconciliation. Missing,
+        // malformed, exited-process and adapter errors also clean up owned rows.
+        if current(&state) != candidate {
+            *state.write().unwrap() = None;
+            bus.vpn_up_since_ms.store(0, Ordering::Relaxed);
+        }
+        let ready = match routes.reconcile(candidate) {
             Ok(ready) => ready,
             Err(error) => {
                 tracing::warn!(%error, "VPN route not ready; will retry");
@@ -246,7 +261,10 @@ pub async fn watcher(state: VpnState, bus: Arc<StatusBus>, shutdown: Shutdown) -
         // Bounded shutdown even when no adapter or route event arrives.
         let until = tokio::time::Instant::now() + POLL_INTERVAL;
         while !shutdown.is_stopped() && tokio::time::Instant::now() < until {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep_until(
+                until.min(tokio::time::Instant::now() + Duration::from_millis(100)),
+            )
+            .await;
         }
     }
     *state.write().unwrap() = None;
@@ -295,6 +313,10 @@ mod tests {
         VpnTarget {
             ipv4: Ipv4Addr::new(10, 8, 0, 2),
             if_index: 42,
+            interface_luid: 1234,
+            adapter_guid: [1; 16],
+            session_id: [2; 16],
+            gateway: Ipv4Addr::new(10, 8, 0, 1),
         }
     }
     fn peer() -> Route {
@@ -326,16 +348,59 @@ mod tests {
         );
     }
     #[test]
-    fn retries_missing_peer_and_failed_add_before_ready() {
+    fn authenticated_peer_needs_no_preexisting_route_and_retries_failed_add() {
         let mut routes = Routes::new(FakeRoutes::default());
-        assert!(routes.reconcile(Some(target())).is_err());
-        routes.api.rows.borrow_mut().push(peer());
         routes.api.fail_add.set(true);
         assert!(routes.reconcile(Some(target())).is_err());
         assert!(routes.owned.is_none());
         routes.api.fail_add.set(false);
         assert_eq!(routes.reconcile(Some(target())).unwrap(), Some(target()));
         assert!(routes.owned.is_some());
+    }
+    #[test]
+    fn rejects_foreign_gateway_default_without_modifying_it() {
+        let mut routes = Routes::new(FakeRoutes::default());
+        let foreign = Route {
+            destination: Ipv4Addr::UNSPECIFIED,
+            prefix: 0,
+            gateway: Ipv4Addr::new(10, 8, 0, 99),
+            ..peer()
+        };
+        routes.api.rows.borrow_mut().push(foreign);
+        assert!(routes.reconcile(Some(target())).is_err());
+        assert!(routes.owned.is_none());
+        routes.reconcile(None).unwrap();
+        assert_eq!(*routes.api.rows.borrow(), vec![foreign]);
+        assert!(routes.api.deleted.borrow().is_empty());
+    }
+    #[test]
+    fn new_session_with_same_interface_and_ip_replaces_owned_route() {
+        let mut routes = Routes::new(FakeRoutes::default());
+        routes.reconcile(Some(target())).unwrap();
+        let old = routes.owned.unwrap();
+        let next = VpnTarget {
+            session_id: [3; 16],
+            ..target()
+        };
+        assert_eq!(routes.reconcile(Some(next)).unwrap(), Some(next));
+        assert_eq!(*routes.api.deleted.borrow(), vec![old]);
+        assert_eq!(routes.api.rows.borrow().len(), 1);
+        assert!(routes.owned.is_some());
+    }
+    #[test]
+    fn reused_index_does_not_borrow_or_delete_old_interface_route() {
+        let mut routes = Routes::new(FakeRoutes::default());
+        let stale = Route {
+            luid: 999,
+            destination: Ipv4Addr::UNSPECIFIED,
+            prefix: 0,
+            ..peer()
+        };
+        routes.api.rows.borrow_mut().push(stale);
+        routes.reconcile(Some(target())).unwrap();
+        assert_eq!(routes.owned.unwrap().luid, target().interface_luid);
+        routes.reconcile(None).unwrap();
+        assert_eq!(*routes.api.rows.borrow(), vec![stale]);
     }
     #[test]
     fn deletes_only_created_default_on_its_exact_interface() {

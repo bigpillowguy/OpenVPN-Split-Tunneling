@@ -44,29 +44,22 @@ public partial class VpnConfigWindow : FluentWindow
 
         try
         {
-            Directory.CreateDirectory(Config.OvpnDir);
-            var fname = Path.GetFileName(dlg.FileName);
-            var dest = Path.Combine(Config.OvpnDir, fname);
-            var counter = 1;
-            while (File.Exists(dest))
-            {
-                var nameOnly = Path.GetFileNameWithoutExtension(fname);
-                var ext = Path.GetExtension(fname);
-                dest = Path.Combine(Config.OvpnDir, $"{nameOnly}-{counter}{ext}");
-                counter++;
-            }
-            File.Copy(dlg.FileName, dest);
-
-            var remote = OvpnParser.ParseRemote(dest) ?? "";
+            using var imported = OvpnProfileImporter.Import(dlg.FileName, Config.OvpnDir);
             var entry = new OvpnEntry
             {
-                DisplayName = Path.GetFileNameWithoutExtension(dest),
-                FilePath = dest,
-                ServerHostname = remote,
+                Id = imported.Id,
+                DisplayName = imported.DisplayName,
+                FilePath = imported.ProfilePath,
+                ServerHostname = imported.ServerHostname,
             };
+            var previous = _cfg.OvpnFiles;
+            _cfg.OvpnFiles = Profiles.Append(entry).ToList();
+            try { _cfg.Save(); }
+            catch { _cfg.OvpnFiles = previous; throw; }
+            imported.Commit();
             Profiles.Add(entry);
             ProfileList.SelectedItem = entry;
-            Persist();
+            ConfigChanged?.Invoke(this, EventArgs.Empty);
         }
         catch (Exception ex)
         {
@@ -115,20 +108,52 @@ public partial class VpnConfigWindow : FluentWindow
     private void DeleteBtn_Click(object sender, RoutedEventArgs e)
     {
         if (_editing is null) return;
+        var entry = _editing;
+        if (ProfileIsInUse(entry))
+        {
+            System.Windows.MessageBox.Show("Disconnect this profile before deleting it; its certificates and keys may still be in use.",
+                "Profile is in use", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
         var result = System.Windows.MessageBox.Show(
-            $"Delete profile \"{_editing.DisplayName}\"?\nThis also removes the imported .ovpn file.",
+            $"Delete profile \"{entry.DisplayName}\"?\nIts owned import folder will be removed. Legacy or external files are preserved.",
             "Confirm delete",
             System.Windows.MessageBoxButton.YesNo,
             System.Windows.MessageBoxImage.Warning);
         if (result != System.Windows.MessageBoxResult.Yes) return;
+        // A connection attempt can start while the confirmation dialog pumps events.
+        if (ProfileIsInUse(entry))
+        {
+            System.Windows.MessageBox.Show("Disconnect this profile before deleting it.",
+                "Profile is in use", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
 
-        try { File.Delete(_editing.FilePath); } catch { }
-        Profiles.Remove(_editing);
-        _editing = null;
-        DetailGrid.Visibility = Visibility.Collapsed;
-        EmptyText.Visibility = Visibility.Visible;
-        Persist();
+        var previous = _cfg.OvpnFiles;
+        var previousActive = _cfg.ActiveOvpnId;
+        _cfg.OvpnFiles = Profiles.Where(profile => profile.Id != entry.Id).ToList();
+        if (_cfg.ActiveOvpnId == entry.Id) _cfg.ActiveOvpnId = _cfg.OvpnFiles.FirstOrDefault()?.Id;
+        try { _cfg.Save(); }
+        catch (Exception error)
+        {
+            _cfg.OvpnFiles = previous;
+            _cfg.ActiveOvpnId = previousActive;
+            ShowSaveError(error);
+            return;
+        }
+        Profiles.Remove(entry);
+        if (Profiles.Count > 0) ProfileList.SelectedIndex = 0;
+        ConfigChanged?.Invoke(this, EventArgs.Empty);
+        try { OvpnProfileImporter.DeleteOwnedProfile(entry.FilePath, Config.OvpnDir); }
+        catch (Exception error)
+        {
+            System.Windows.MessageBox.Show($"The profile was removed from the list, but its files were preserved:\n{error.Message}",
+                "Profile files retained", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
     }
+
+    private static bool ProfileIsInUse(OvpnEntry entry) => App.Connector.ActiveProfileId == entry.Id &&
+        (App.Connector.HasSession || App.Connector.State is VpnConnectionState.Connecting or VpnConnectionState.Connected or VpnConnectionState.Disconnecting);
 
     private async void ConnectProfileBtn_Click(object sender, RoutedEventArgs e)
     {

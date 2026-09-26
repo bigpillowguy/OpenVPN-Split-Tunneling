@@ -18,6 +18,8 @@ internal sealed class OpenVpnSession : IVpnSession
     private readonly TaskCompletionSource _completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private Process? _process;
     private SessionSecrets? _secrets;
+    private VpnSessionBindingStore.Lease? _binding;
+    private readonly OpenVpnTunnelMetadata _tunnel = new();
     private TcpClient? _tcp;
     private StreamWriter? _writer;
     private Task? _readerTask;
@@ -41,6 +43,8 @@ internal sealed class OpenVpnSession : IVpnSession
         ManagementProtocol.Quote(_profile.GetPassword());
         ct.ThrowIfCancellationRequested();
         _secrets = new SessionSecrets();
+        var runtimeProfile = OvpnRuntimeProfile.Create(_profile.FilePath, _secrets.DirectoryPath);
+        _binding = Redirector.BeginSessionBinding();
         var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
         var port = ((IPEndPoint)listener.LocalEndpoint).Port;
@@ -49,13 +53,13 @@ internal sealed class OpenVpnSession : IVpnSession
         {
             WorkingDirectory = Path.GetDirectoryName(_profile.FilePath), UseShellExecute = false, CreateNoWindow = true,
         };
-        foreach (var argument in new[] { "--config", _profile.FilePath, "--management", "127.0.0.1", port.ToString(),
+        foreach (var argument in new[] { "--config", runtimeProfile, "--management", "127.0.0.1", port.ToString(),
                      _secrets.PasswordFile, "--management-query-passwords", "--management-hold", "--management-signal",
-                     "--pull-filter", "ignore", "redirect-gateway", "--pull-filter", "ignore", "block-outside-dns",
+                     "--management-up-down",
                      "--log", Path.Combine(_secrets.DirectoryPath, "openvpn.log"), "--verb", "3" })
             psi.ArgumentList.Add(argument);
         if (requiresAuth) psi.ArgumentList.Add("--auth-user-pass");
-        // OpenVPN 2.7 selects DCO/TAP itself; --windows-driver wintun is obsolete.
+        // OpenVPN reports the device it actually opened through the authenticated management channel.
         _process = JobManager.Start(psi);
         _ = WatchProcessAsync(_process);
         using var startup = CancellationTokenSource.CreateLinkedTokenSource(ct, _lifetime.Token);
@@ -82,6 +86,7 @@ internal sealed class OpenVpnSession : IVpnSession
         _secrets.ReleasePasswordFile();
         _readerTask = ReadManagementAsync(reader, _lifetime.Token);
         await SendAsync("state on", startup.Token).ConfigureAwait(false);
+        await SendAsync("hold off", startup.Token).ConfigureAwait(false);
         await SendAsync("hold release", startup.Token).ConfigureAwait(false);
         await _connected.Task.WaitAsync(startup.Token).ConfigureAwait(false);
     }
@@ -90,7 +95,7 @@ internal sealed class OpenVpnSession : IVpnSession
     {
         try
         {
-            while (await reader.ReadLineAsync(ct).ConfigureAwait(false) is { } line)
+            while (await ReadLineAsync(reader, ct).ConfigureAwait(false) is { } line)
             {
                 if (line.StartsWith(">PASSWORD:Need 'Auth'", StringComparison.Ordinal) && !line.Contains("SC:", StringComparison.Ordinal))
                 {
@@ -99,15 +104,33 @@ internal sealed class OpenVpnSession : IVpnSession
                 }
                 else if (line.StartsWith(">PASSWORD:Need", StringComparison.Ordinal) || line.StartsWith(">PASSWORD:Verification Failed", StringComparison.Ordinal))
                     throw new InvalidOperationException("OpenVPN authentication failed or requires an unsupported private-key password/challenge. Check the profile and credentials.");
+                else if (line.StartsWith(">UPDOWN:", StringComparison.Ordinal))
+                {
+                    if (line is ">UPDOWN:UP" or ">UPDOWN:DOWN")
+                    {
+                        _binding?.Revoke();
+                        ConnectionChanged?.Invoke(this, false);
+                    }
+                    _tunnel.Consume(line);
+                }
                 else if (line.StartsWith(">STATE:", StringComparison.Ordinal))
                 {
                     var fields = line[7..].Split(',');
                     if (fields.Length > 2 && fields[1] == "CONNECTED" && fields[2] == "SUCCESS")
                     {
+                        var tunnel = _tunnel.Current ?? throw new InvalidDataException("OpenVPN connected without fresh tunnel identity metadata.");
+                        if (fields.Length < 4) throw new InvalidDataException("OpenVPN omitted its connected IPv4 address.");
+                        var adapter = WindowsVpnAdapter.Resolve(tunnel, OpenVpnTunnelMetadata.ParseIpv4(fields[3]));
+                        _binding!.Publish(_process!, tunnel, adapter);
                         _connected.TrySetResult();
                         ConnectionChanged?.Invoke(this, true);
                     }
-                    else if (fields.Length > 1 && fields[1] == "RECONNECTING") ConnectionChanged?.Invoke(this, false);
+                    else if (fields.Length > 1 && fields[1] is "RECONNECTING" or "EXITING")
+                    {
+                        _binding?.Revoke();
+                        _tunnel.Reset();
+                        ConnectionChanged?.Invoke(this, false);
+                    }
                 }
                 else if (line.StartsWith(">FATAL:", StringComparison.Ordinal))
                     throw new InvalidOperationException("OpenVPN reported a fatal error. Inspect the session log.");
@@ -124,7 +147,11 @@ internal sealed class OpenVpnSession : IVpnSession
                 _completion.TrySetResult(); // The controller stops the still-owned process.
             }
         }
-        finally { reader.Dispose(); }
+        finally
+        {
+            RevokeBinding();
+            reader.Dispose();
+        }
     }
 
     private async Task WatchProcessAsync(Process process)
@@ -138,7 +165,11 @@ internal sealed class OpenVpnSession : IVpnSession
                 _connected.TrySetException(new InvalidOperationException(Failure));
             }
         }
-        finally { _completion.TrySetResult(); }
+        finally
+        {
+            RevokeBinding();
+            _completion.TrySetResult();
+        }
     }
 
     private async Task SendAsync(string command, CancellationToken ct)
@@ -151,6 +182,8 @@ internal sealed class OpenVpnSession : IVpnSession
     public async Task StopAsync()
     {
         _stopping = true;
+        // Invalidate the writer before any asynchronous wait; queued CONNECTED cannot republish.
+        RevokeBinding();
         if (_process is { HasExited: false } process)
         {
             using var grace = new CancellationTokenSource(TimeSpan.FromSeconds(2));
@@ -178,10 +211,33 @@ internal sealed class OpenVpnSession : IVpnSession
 
     public void Dispose()
     {
+        RevokeBinding();
         _lifetime.Dispose();
         _writer?.Dispose();
         _tcp?.Dispose();
         _process?.Dispose();
         _secrets?.Dispose();
+    }
+
+    private static async Task<string?> ReadLineAsync(StreamReader reader, CancellationToken ct)
+    {
+        var line = new StringBuilder();
+        var character = new char[1];
+        while (await reader.ReadAsync(character.AsMemory(), ct).ConfigureAwait(false) != 0)
+        {
+            if (character[0] == '\n') return line.ToString().TrimEnd('\r');
+            if (line.Length >= 8192) throw new InvalidDataException("OpenVPN management line exceeds the supported limit.");
+            line.Append(character[0]);
+        }
+        return line.Length == 0 ? null : throw new EndOfStreamException("OpenVPN management frame was truncated.");
+    }
+
+    private void RevokeBinding()
+    {
+        // Lease invalidation happens before file deletion. A filesystem error must not
+        // prevent stopping the child: the consumer also checks its retained process identity.
+        try { _binding?.Dispose(); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        { Failure ??= "The session file could not be removed; the owned OpenVPN process is stopping."; }
     }
 }

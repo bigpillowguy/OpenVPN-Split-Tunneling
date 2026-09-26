@@ -10,6 +10,10 @@ public static class Redirector
 {
     private static Process? _process;
     private static EventWaitHandle? _shutdown;
+    private static VpnSessionBindingStore? _sessionBindings;
+
+    internal static VpnSessionBindingStore.Lease BeginSessionBinding() =>
+        (_sessionBindings ?? throw new InvalidOperationException("The VPN backend is not running.")).Begin();
 
     public static bool IsOwnedServer(uint pid) => _process is { HasExited: false } process && (uint)process.Id == pid;
 
@@ -26,7 +30,11 @@ public static class Redirector
         _shutdown = new EventWaitHandle(false, EventResetMode.ManualReset, eventName);
         start.ArgumentList.Add("--shutdown-event");
         start.ArgumentList.Add(eventName);
-        _process = JobManager.Start(start);
+        _sessionBindings = new VpnSessionBindingStore();
+        start.ArgumentList.Add("--session-file");
+        start.ArgumentList.Add(_sessionBindings.FilePath);
+        try { _process = JobManager.Start(start); }
+        catch { _sessionBindings.Dispose(); _sessionBindings = null; throw; }
     }
 
     public static string? FindBinary(string baseDirectory)
@@ -59,6 +67,7 @@ public static class Redirector
 
     public static void Dispose()
     {
+        _sessionBindings?.Dispose(); _sessionBindings = null;
         _shutdown?.Dispose(); _shutdown = null;
         _process?.Dispose(); _process = null;
     }

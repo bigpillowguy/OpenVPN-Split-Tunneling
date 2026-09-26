@@ -445,13 +445,19 @@ async fn vpn_target_change_removes_flows_even_without_down_transition() {
     let mut tcp_flows = HashMap::from([(key, flow)]);
     let mut udp_flows = HashMap::new();
     let stats = stats();
-    let old = Some(VpnTarget {
+    let old_target = VpnTarget {
         ipv4: Ipv4Addr::new(10, 8, 0, 2),
         if_index: 5,
-    });
+        interface_luid: 1234,
+        adapter_guid: [1; 16],
+        session_id: [2; 16],
+        gateway: Ipv4Addr::new(10, 8, 0, 1),
+    };
+    let old = Some(old_target);
     let new = Some(VpnTarget {
-        ipv4: Ipv4Addr::new(10, 9, 0, 2),
-        if_index: 8,
+        // A reconnect can reuse every address and interface field.
+        session_id: [3; 16],
+        ..old_target
     });
     on_vpn_change(
         old,
