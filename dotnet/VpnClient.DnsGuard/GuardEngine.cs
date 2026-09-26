@@ -18,6 +18,18 @@ public sealed class GuardException(string reason, bool unsupported = false) : Ex
     public bool Unsupported { get; } = unsupported;
 }
 
+internal static class GuardActivationPolicy
+{
+    internal static void ValidateOriginal(RegistryState original)
+    {
+        // OWN_PROCESS activation extended the original technique without verified
+        // DNS API fallback. This is an activation-only compatibility gate, not a
+        // claim that the service type itself caused the observed RPC failure.
+        // Existing journals of either type must remain fully recoverable.
+        if (original.Type == 0x10) throw new GuardException("dns_api_fallback_unverified", true);
+    }
+}
+
 public interface IGuardJournalStore
 {
     GuardJournal? Read();
@@ -58,6 +70,7 @@ public sealed class GuardEngine(IGuardPlatform platform, IGuardJournalStore stor
             owner = platform.OpenOwner(request.Owner, false);
             backend = platform.OpenOwner(request.Backend, true);
             var original = platform.ReadRegistry();
+            GuardActivationPolicy.ValidateOriginal(original);
             originalProcess = platform.InspectOriginal(original);
             var journal = new GuardJournal(1, request, original, platform.StubImage(request.Lease), "prepared");
             // Durable write precedes either registry mutation. A failed write performs no machine mutation.

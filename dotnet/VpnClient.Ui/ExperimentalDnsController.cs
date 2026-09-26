@@ -183,7 +183,11 @@ internal sealed class ExperimentalDnsController
                 lock (_sync) _rejected = target;
                 var terminal = reply.Status == "unsupported" ? ExperimentalDnsState.Unsupported : ExperimentalDnsState.RecoveryRequired;
                 _rejectionState = terminal;
-                _rejectionDetail = reply.Status == "unsupported" ? "This Windows configuration does not support the experimental DNS guard. " + reply.Reason : "DNS activation could not be confirmed. " + reply.Reason;
+                _rejectionDetail = reply.Status == "unsupported"
+                    ? reply.Reason == "dns_api_fallback_unverified"
+                        ? "Experimental split DNS is unavailable for this Windows DNS Client configuration. The DNS Client service has not been replaced; per-app DNS isolation is off."
+                        : "This Windows configuration does not support the experimental DNS guard. " + reply.Reason
+                    : "DNS activation could not be confirmed. " + reply.Reason;
                 SetState(ExperimentalDnsState.RecoveryRequired, "Restoring an unconfirmed or superseded DNS lease.");
                 if (!await RestoreLeaseAsync(acquiredLease).ConfigureAwait(false)) return;
                 if (EffectiveTarget() != target) continue;

@@ -2,14 +2,14 @@
 ;
 ; Use installer/build.ps1 to build, validate dependencies and compile this script.
 ;
-; Output:  installer\Output\VpnClientSetup-1.3.2.exe
+; Output:  installer\Output\VpnClientSetup-1.3.3.exe
 
 #if VER < EncodeVer(6, 7, 0)
   #error "Inno Setup 6.7 or newer is required"
 #endif
 
 #define MyAppName      "OpenVPN Split Tunneling Client"
-#define MyAppVersion   "1.3.2"
+#define MyAppVersion   "1.3.3"
 #define MyAppPublisher "ena"
 #define MyAppExeName   "VpnClient.Ui.exe"
 #define MyAppId        "{{A6A4F2D2-6E1E-4D6F-A2D6-9E1F7B3B8FCC}"

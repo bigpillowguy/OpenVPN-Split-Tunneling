@@ -285,6 +285,33 @@ public sealed class ExperimentalDnsTests
         Assert.Equal(ExperimentalDnsState.RecoveryRequired, model.State);
     }
 
+    [Fact]
+    public async Task UnsupportedDnsApiConfigurationWaitsForDisarmAndDoesNotRetrySameSession()
+    {
+        var guard = new FakeGuard { UnsupportedReason = "dns_api_fallback_unverified" };
+        var control = new FakeControl(guard.Calls) { BlockDisarm = true };
+        var model = new ExperimentalDnsController(guard, Owner, control);
+        model.StateChanged += (_, _) => guard.ObservedStates.Add(model.State);
+        await model.InitializeAsync(true);
+        var target = Target();
+        var observed = model.ObserveAsync(target);
+        await control.DisarmStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Single(guard.Released);
+        Assert.False(observed.IsCompleted);
+        Assert.Equal(ExperimentalDnsState.RecoveryRequired, model.State);
+        control.DisarmAck.SetResult();
+        await observed;
+        Assert.Equal(ExperimentalDnsState.Unsupported, model.State);
+        Assert.Contains("per-app DNS isolation is off", model.Detail);
+        Assert.False(control.Confirmed);
+        Assert.Equal(new[] { "recover", "arm", "acquire", "release", "disarm" }, guard.Calls);
+        await model.ObserveAsync(target);
+        await model.CheckFreshnessAsync();
+        Assert.Single(guard.Acquired);
+        Assert.DoesNotContain(ExperimentalDnsState.Active, guard.ObservedStates);
+        await model.PauseAsync();
+    }
+
     private sealed class FakeControl(List<string>? calls = null) : IDnsControlClient
     {
         private Guid? _lease;
@@ -319,6 +346,7 @@ public sealed class ExperimentalDnsTests
         public readonly TaskCompletionSource AcquireStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public readonly TaskCompletionSource<DnsGuardReply> AcquireReply = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public bool BlockAcquire, ThrowAcquire, FailRelease;
+        public string? UnsupportedReason;
         public DnsGuardReply Recovery = Off();
         public DnsGuardReply? Inspected;
         public Task<DnsGuardReply> RecoverAsync() { Calls.Add("recover"); return Task.FromResult(Recovery); }
@@ -327,6 +355,7 @@ public sealed class ExperimentalDnsTests
         {
             Assert.Equal(Owner, owner); Calls.Add("acquire"); Acquired.Add(lease); AcquireStarted.TrySetResult();
             if (ThrowAcquire) throw new IOException("owned fake transport failure");
+            if (UnsupportedReason is { } reason) return Task.FromResult(new DnsGuardReply(1, "unsupported", lease, reason));
             return BlockAcquire ? AcquireReply.Task : Task.FromResult(new DnsGuardReply(1, "active", lease, "active"));
         }
         public Task<DnsGuardReply> ReleaseAsync(Guid lease)

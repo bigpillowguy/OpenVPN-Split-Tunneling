@@ -220,16 +220,75 @@ public sealed class GuardEngineTests
         Assert.NotEqual("complete", fixture.Store.Value.Phase);
     }
 
-    [Fact]
-    public void OwnProcessOriginalTypeIsPreservedAcrossActivationAndRecovery()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void OwnProcessActivationRefusesBeforeJournalOrMachineChanges(bool previousCompletedLease)
     {
         var fixture = new Fixture();
         fixture.Platform.ExpectedOriginal = Original with { Type = 0x10 };
         fixture.Platform.Registry = fixture.Platform.ExpectedOriginal;
-        Assert.Equal("active", fixture.Engine.Activate(fixture.Request, () => false).Status);
+        if (previousCompletedLease)
+            fixture.Store.Value = new(1, Request(), fixture.Platform.ExpectedOriginal, "stub-command", "complete");
+        var previous = fixture.Store.Value;
+
+        var result = fixture.Engine.Activate(fixture.Request, () => false);
+
+        Assert.Equal("unsupported", result.Status);
+        Assert.Equal("dns_api_fallback_unverified", result.Reason);
+        Assert.Equal(fixture.Request.Lease, result.Lease);
+        Assert.Equal(2, result.ExitCode);
+        Assert.Same(previous, fixture.Store.Value);
+        Assert.Empty(fixture.Snapshots);
+        Assert.Equal(fixture.Platform.ExpectedOriginal, fixture.Platform.Registry);
+        Assert.Equal("original", fixture.Platform.Service);
+        Assert.Equal(new[] { "owner", "backend" }, fixture.Events);
+    }
+
+    [Theory]
+    [InlineData("prepared", "original", false)]
+    [InlineData("image_changed", "original", true)]
+    [InlineData("configuration_changed", "original", true)]
+    [InlineData("original_exited", "down", true)]
+    [InlineData("stub_running", "stub", true)]
+    [InlineData("registry_restored", "stub", false)]
+    [InlineData("active", "stub", false)]
+    [InlineData("restoring", "stub", false)]
+    [InlineData("recovery_required", "down", false)]
+    public void ExistingOwnProcessLeaseRestoresFromEveryPriorPhase(string phase, string service, bool stubImage)
+    {
+        var fixture = new Fixture();
+        fixture.Platform.ExpectedOriginal = Original with { Type = 0x10 };
+        fixture.Platform.Registry = new(stubImage ? "stub-command" : Original.ImagePath, 0x10);
+        fixture.Platform.Service = service;
+        fixture.Platform.OwnerAlive = false;
+        fixture.Platform.BackendAlive = false;
+        fixture.Store.Value = new(1, fixture.Request, fixture.Platform.ExpectedOriginal, "stub-command", phase);
+
+        Assert.Equal("off", fixture.Engine.Restore().Status);
+
+        Assert.Equal(fixture.Platform.ExpectedOriginal, fixture.Platform.Registry);
+        Assert.Equal("original", fixture.Platform.Service);
+        Assert.Equal("complete", fixture.Store.Value!.Phase);
         Assert.Equal(0x10u, fixture.Store.Value!.Original.Type);
+        Assert.DoesNotContain("terminate-original", fixture.Events);
+        Assert.Equal(0, fixture.Platform.ForeignTerminations);
+    }
+
+    [Fact]
+    public void ExistingActiveOwnProcessLeaseRemainsInspectableAndRecoverable()
+    {
+        var fixture = new Fixture();
+        fixture.Platform.ExpectedOriginal = Original with { Type = 0x10 };
+        fixture.Platform.Registry = fixture.Platform.ExpectedOriginal;
+        fixture.Platform.Service = "stub";
+        fixture.Store.Value = new(1, fixture.Request, fixture.Platform.ExpectedOriginal, "stub-command", "active");
+
+        Assert.Equal("active", fixture.Engine.Inspect().Status);
         Assert.Equal("off", fixture.Engine.Restore().Status);
         Assert.Equal(fixture.Platform.ExpectedOriginal, fixture.Platform.Registry);
+        Assert.Equal("original", fixture.Platform.Service);
+        Assert.Equal("off", fixture.Engine.Inspect().Status);
     }
 
     private sealed record Snapshot(GuardJournal? Journal, RegistryState Registry, string Service);

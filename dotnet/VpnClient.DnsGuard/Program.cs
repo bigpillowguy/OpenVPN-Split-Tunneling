@@ -56,7 +56,9 @@ internal static class Program
         }
         ProtectedStorage.RequireAdmin();
         using var mutex = MachineMutex.Enter();
-        ProtectedStorage.EnsureCreated();
+        // A rejected new activation must not even create protected storage.
+        // Recovery and maintenance retain their existing storage preparation.
+        if (args[0] != "acquire") ProtectedStorage.EnsureCreated();
         switch (args[0])
         {
             case "acquire":
@@ -64,12 +66,15 @@ internal static class Program
                 var options = Options(args, "lease", "owner-pid", "owner-created", "backend-pid", "backend-created");
                 var request = new LeaseRequest(GuidValue(options, "lease"), Identity(options, "owner"), Identity(options, "backend"));
                 if (request.Owner.Pid == request.Backend.Pid) throw new GuardException("owner_identity_mismatch", true);
-                CheckMaintenance(store);
                 var journal = store.Read();
                 if (journal is not null && journal.Phase != "complete") return GuardResult.Of("busy", journal.Request.Lease, "existing_lease");
                 // Read-only preflight before creating even the separate recovery service.
+                var original = platform.ReadRegistry();
+                GuardActivationPolicy.ValidateOriginal(original);
+                CheckMaintenance(store);
                 platform.ValidateOwners(request, true);
-                using (platform.InspectOriginal(platform.ReadRegistry())) { }
+                using (platform.InspectOriginal(original)) { }
+                ProtectedStorage.EnsureCreated();
                 GuardianService.EnsureInstalled();
                 using var service = GuardianService.Open(16 | 32) ?? throw new GuardException("guardian_missing");
                 if (Native.Status(service).State != 1) return GuardResult.Of("busy", reason: "guardian_running");
