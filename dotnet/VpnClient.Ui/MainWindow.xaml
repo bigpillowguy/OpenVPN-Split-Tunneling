@@ -55,10 +55,14 @@
                                       FontTypography="Body"
                                       Foreground="{DynamicResource TextFillColorSecondaryBrush}"
                                       Margin="24,4,0,0" />
-                        <ui:TextBlock Text="Per-app VPN DNS is not enabled."
+                        <CheckBox x:Name="ExperimentalDnsToggle" Content="Experimental split DNS" Click="ExperimentalDnsToggle_Click"
+                                  Margin="24,8,12,0" />
+                        <ui:TextBlock Text="Temporarily changes the shared Windows DNS Client (Dnscache) service. Only ordinary IPv4 DNS on port 53 is redirected; DoH/DoT is not replaced. Disconnect VPN before changing this setting."
                                       FontTypography="Caption" TextWrapping="Wrap"
                                       Foreground="{DynamicResource TextFillColorSecondaryBrush}"
                                       Margin="24,4,12,0" />
+                        <ui:TextBlock x:Name="ExperimentalDnsText" Text="Experimental split DNS is off."
+                                      FontTypography="Caption" TextWrapping="Wrap" Margin="24,4,12,0" />
                     </StackPanel>
                     <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
                         <ui:Button x:Name="VpnSettingsBtn"

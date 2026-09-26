@@ -13,16 +13,18 @@ profile and any credentials required by your provider.
 - Selection matches an executable path. Add each executable you want to tunnel,
   including games or helper programs launched by a selected launcher. Child
   processes with different paths are not automatically selected.
-- Only IPv4 TCP/UDP are captured. IPv6 and other protocols can use the normal
+- Ordinary traffic forwarding covers IPv4 TCP/UDP. IPv6 and other protocols can use the normal
   connection. Disabling IPv6 on the VPN profile alone does not stop IPv6 on the
   physical interface.
 - The client is **fail-open**: when the VPN is unavailable, selected applications
   may use the default route. This is not a kill switch or an anonymity boundary.
-- **DNS remains unchanged:** selecting an EXE does not isolate its DNS queries.
-  Local and server-pushed DNS/DHCP settings are excluded from the runtime profile.
-  System DNS configuration and the Windows DNS Client service remain unchanged.
-  Per-application VPN DNS is being investigated with Windows VPN Platform;
-  it is not enabled in the client. See [DNS-RESEARCH.md](DNS-RESEARCH.md).
+- **DNS remains unchanged by default.** Version 1.3.1 includes an opt-in experimental
+  mode for ordinary IPv4 DNS on UDP/TCP port 53. It redirects selected executables'
+  queries to the current VPN provider's DNS through the VPN interface. This mode
+  temporarily replaces the shared Windows DNS Client service (`Dnscache`), which
+  affects system-wide caching and resolver behavior. It is not yet validated by
+  live packet captures or crash/reboot tests. See the limits below and
+  [DNS-RESEARCH.md](DNS-RESEARCH.md).
 - Each connection uses a temporary profile that suppresses local/pushed routes,
   including `redirect-gateway` and IPv4 `/1` routes. The stored profile is preserved.
   OpenVPN still configures its tunnel interface; the redirector prepares a route
@@ -74,14 +76,51 @@ and diagnostic path displayed below the connection state. Each launch keeps
 `redirector.log` under `%LOCALAPPDATA%\VpnClient\runtime\<launch-id>\` with one
 rotated `.1` archive (up to 2 MiB each). Logs survive normal client shutdown;
 the session binding and temporary profile containing keys are removed.
-Version 1.2.0 preserves ordinary application startup and DNS while Windows VPN
-Platform is tested separately.
+Applications start normally. Experimental split DNS does not require a custom
+application launcher or changes to an application's DNS settings.
 
 Close this client's session before upgrading or uninstalling. Setup uses file
 ownership and Windows Restart Manager for in-use application files; it does not
 kill all `openvpn.exe` processes or delete a shared WinDivert service. A locked
 driver may require a restart. OpenVPN is a separate installed prerequisite and
 is not removed when this client is uninstalled.
+
+### Experimental split DNS
+
+While disconnected, enable **Experimental split DNS** in the main window, then
+connect. The client requires current provider DNS metadata, a ready redirector
+and a confirmed recovery-service lease before showing DNS as active. Enabling
+the option alone is not evidence of DNS isolation. Install under Program Files;
+the recovery helper refuses an untrusted or writable installation directory.
+
+The mode replaces `Dnscache` with a temporary stub so ordinary resolver calls
+can emit packets in the calling process. Its independent recovery service keeps
+a durable journal and restores the original service after disconnect, UI/backend
+exit or a later service restart. Shared or unverified Dnscache hosts are refused;
+the client never terminates another NetworkService host to force activation.
+Recovery after real crashes and reboots remains an acceptance requirement.
+
+- Unselected applications retain their DNS destinations and ordinary routes,
+  but also experience the shared DNS Client service/cache change.
+- Selected IPv6 or loopback DNS is currently blocked. Queries with unknown or
+  ambiguous process ownership are blocked too; that can affect unselected
+  applications whose DNS ownership cannot be established.
+- Unattributable TCP/UDP IP fragments are blocked in this mode to prevent DNS
+  bypass through noninitial fragments. This may also interrupt fragmented
+  traffic from unselected applications. IPv6 fragments with unresolved extension
+  headers are also blocked; fragment reassembly is not implemented.
+- Loss of the provider/session lease blocks selected ordinary DNS while this
+  redirector is running. Other traffic retains the normal fail-open behavior.
+- An application's own DoH/DoT resolver is not replaced with the provider's DNS.
+  Shared proxy/resolver processes do not provide the original application's EXE
+  identity. This is not universal DNS isolation or a kill switch.
+
+The option is off by default. Change it while disconnected. Upgrade/uninstall
+refuses a live DNS lease or incomplete restoration and keeps the recovery files
+in place. For diagnostics, run the installed
+`DnsGuard\VpnClient.DnsGuard.exe inspect` as administrator. Do not manually remove
+that directory while recovery is pending. The saved Windows VPN Platform
+experiment is paused in [research/VpnPlatform](research/VpnPlatform/README.md).
 
 ### Profile import
 
@@ -165,10 +204,10 @@ powershell -ExecutionPolicy Bypass -File C:\path\to\OpenVPN-Split-Tunneling\inst
 ```
 
 The script enters the repository root, puts rustup before any older system Rust
-installation, checks MSVC, builds with `Cargo.lock`, publishes the UI, verifies
+installation, checks MSVC, builds with `Cargo.lock`, publishes the UI and DNS recovery helper, verifies
 NuGet dependencies against `packages.lock.json`, checks the WinDivert staging
 files, and compiles setup. It **never executes the setup**.
-The output is `installer/Output/VpnClientSetup-1.2.0.exe`.
+The output is `installer/Output/VpnClientSetup-1.3.1.exe`.
 
 The bundled OpenVPN download is pinned by SHA-256 and requires a valid OpenVPN
 Authenticode signature. Every cached use is checked; downloads are verified
@@ -185,9 +224,13 @@ cargo test --workspace --locked
 ./research/VpnPlatform/build.ps1 # offline checks and unsigned VM package only
 dotnet restore dotnet/VpnClient.Tests/VpnClient.Tests.csproj --locked-mode
 dotnet test dotnet/VpnClient.Tests/VpnClient.Tests.csproj -c Release --nologo --no-restore
+dotnet restore dotnet/VpnClient.DnsGuard.Tests/VpnClient.DnsGuard.Tests.csproj --locked-mode
+dotnet test dotnet/VpnClient.DnsGuard.Tests/VpnClient.DnsGuard.Tests.csproj -c Release --nologo --no-restore
 cargo build --locked --release -p redirector
 dotnet restore dotnet/VpnClient.Ui/VpnClient.Ui.csproj --locked-mode
 dotnet publish dotnet/VpnClient.Ui/VpnClient.Ui.csproj -c Release --no-restore
+dotnet restore dotnet/VpnClient.DnsGuard/VpnClient.DnsGuard.csproj --locked-mode
+dotnet publish dotnet/VpnClient.DnsGuard/VpnClient.DnsGuard.csproj -c Release --no-restore
 ./installer/test-native-staging.ps1
 ./installer/test-legacy-retirement.ps1
 ./installer/test-dependencies.ps1  # requires the verified MSI cache from build.ps1
@@ -196,7 +239,7 @@ dotnet publish dotnet/VpnClient.Ui/VpnClient.Ui.csproj -c Release --no-restore
 Keep `redirector.exe`, `WinDivert.dll` and `WinDivert64.sys` together when running
 a built client. Do not rely on a hard-coded developer checkout path.
 
-Both .NET projects keep NuGet lockfiles in source control. When intentionally
+The .NET projects keep NuGet lockfiles in source control. When intentionally
 updating a package reference, run `dotnet restore <project> --force-evaluate`,
 review the lockfile diff and rerun tests. CI and packaging use locked restores
 and fail if the package graph disagrees with the committed lockfile.
@@ -204,15 +247,16 @@ and fail if the package graph disagrees with the committed lockfile.
 Windows CI is configured to check formatting, clippy and tests, and produce an
 unsigned installer artifact without installing OpenVPN or starting VPN/driver
 processes. Product/setup version
-`1.2.0` and internal Rust workspace crate version `0.1.0` are separate identifiers.
+`1.3.1` and internal Rust workspace crate version `0.1.0` are separate identifiers.
 
 ## Source layout and licenses
 
 | Directory | Purpose |
 | --- | --- |
 | `dotnet/VpnClient.Ui/` | WPF UI and VPN process management |
+| `dotnet/VpnClient.DnsGuard/` | Experimental DNS stub, independent recovery service and durable journal |
 | `redirector/` | Rust packet redirector |
-| `research/VpnPlatform/` | Windows VPN Platform per-application DNS experiment |
+| `research/VpnPlatform/` | Paused Windows VPN Platform per-application DNS experiment |
 | `ipc/` | Protobuf definitions and framing |
 | `installer/` | Build, prerequisite validation, setup, licenses |
 | `vendor/windivert/` | WinDivert 2.2.2 binaries and upstream license |

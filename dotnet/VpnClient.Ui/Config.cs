@@ -14,6 +14,7 @@ public class Config
     public List<OvpnEntry> OvpnFiles { get; set; } = new();
     public string? ActiveOvpnId { get; set; }
     public List<AppEntry> TunneledApps { get; set; } = new();
+    public bool ExperimentalSplitDns { get; set; }
 
     [JsonIgnore]
     public static string AppDataDir =>

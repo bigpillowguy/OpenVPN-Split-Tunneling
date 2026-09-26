@@ -50,6 +50,15 @@ impl Binding {
         }
         Ok(())
     }
+
+    pub fn tcp_socket(&self) -> Result<TcpSocket, u32> {
+        let socket = TcpSocket::new_v4().map_err(|_| SERVER_FAILURE)?;
+        socket
+            .bind(SocketAddr::V4(SocketAddrV4::new(self.source, 0)))
+            .map_err(|_| SERVER_FAILURE)?;
+        self.pin(&socket)?;
+        Ok(socket)
+    }
 }
 
 pub async fn exchange(
@@ -57,6 +66,27 @@ pub async fn exchange(
     servers: &[SocketAddrV4],
     request: &[u8],
     question: &wire::Question,
+) -> Result<Vec<u8>, u32> {
+    exchange_mode(binding, servers, request, question, true).await
+}
+
+/// Transparent UDP interception must preserve TC. The original application
+/// chooses TCP retry, whose separate stream is intercepted by the dataplane.
+pub async fn exchange_datagram(
+    binding: Binding,
+    servers: &[SocketAddrV4],
+    request: &[u8],
+    question: &wire::Question,
+) -> Result<Vec<u8>, u32> {
+    exchange_mode(binding, servers, request, question, false).await
+}
+
+async fn exchange_mode(
+    binding: Binding,
+    servers: &[SocketAddrV4],
+    request: &[u8],
+    question: &wire::Question,
+    tcp_fallback: bool,
 ) -> Result<Vec<u8>, u32> {
     let mut random = [0; 2];
     unsafe { BCryptGenRandom(None, &mut random, BCRYPT_USE_SYSTEM_PREFERRED_RNG) }
@@ -69,7 +99,7 @@ pub async fn exchange(
     for server in servers {
         let attempt = tokio::time::timeout(
             Duration::from_secs(2),
-            one(binding, *server, &query, id, question),
+            one(binding, *server, &query, id, question, tcp_fallback),
         )
         .await;
         match attempt {
@@ -90,6 +120,7 @@ async fn one(
     query: &[u8],
     id: u16,
     question: &wire::Question,
+    tcp_fallback: bool,
 ) -> Result<Vec<u8>, u32> {
     let socket = UdpSocket::bind(SocketAddrV4::new(binding.source, 0))
         .await
@@ -105,12 +136,12 @@ async fn one(
             .await
             .map_err(|_| SERVER_FAILURE)?;
         match wire::response(&response[..received], id, question) {
-            Ok(wire::Response::Complete) => {
+            Ok(wire::Response::Truncated) if tcp_fallback => {
+                return tcp(binding, server, query, id, question).await
+            }
+            Ok(_) => {
                 response.truncate(received);
                 return Ok(response);
-            }
-            Ok(wire::Response::Truncated) => {
-                return tcp(binding, server, query, id, question).await
             }
             Err(()) => {} // Ignore mismatched IDs/questions, with bounded work/deadline.
         }
@@ -125,11 +156,7 @@ async fn tcp(
     id: u16,
     question: &wire::Question,
 ) -> Result<Vec<u8>, u32> {
-    let socket = TcpSocket::new_v4().map_err(|_| SERVER_FAILURE)?;
-    socket
-        .bind(SocketAddr::V4(SocketAddrV4::new(binding.source, 0)))
-        .map_err(|_| SERVER_FAILURE)?;
-    binding.pin(&socket)?;
+    let socket = binding.tcp_socket()?;
     let mut stream = socket
         .connect(SocketAddr::V4(server))
         .await

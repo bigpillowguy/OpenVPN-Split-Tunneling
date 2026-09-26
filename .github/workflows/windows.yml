@@ -41,6 +41,11 @@ jobs:
           dotnet test dotnet/VpnClient.Tests/VpnClient.Tests.csproj -c Release --nologo --no-restore
       - name: Windows VPN Platform offline build and tests
         run: powershell -NoProfile -ExecutionPolicy Bypass -File research/VpnPlatform/build.ps1
+      - name: DNS recovery state tests (no service changes)
+        run: |
+          dotnet restore dotnet/VpnClient.DnsGuard.Tests/VpnClient.DnsGuard.Tests.csproj --locked-mode
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          dotnet test dotnet/VpnClient.DnsGuard.Tests/VpnClient.DnsGuard.Tests.csproj -c Release --nologo --no-restore
       - name: Install Inno Setup compiler
         run: |
           $compiler = Join-Path $env:RUNNER_TEMP 'innosetup-6.7.3.exe'

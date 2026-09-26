@@ -12,6 +12,8 @@ public static class SnapshotValidator
     {
         if (snapshot.Vpn is null || snapshot.Vpn.UptimeMs > (ulong)(TimeSpan.MaxValue.Ticks / TimeSpan.TicksPerMillisecond)) return false;
         if (snapshot.Vpn.Up && (!IPAddress.TryParse(snapshot.Vpn.AdapterIp, out var address) || address.AddressFamily != AddressFamily.InterNetwork)) return false;
+        if (snapshot.SplitDns is { } dns && (dns.Fault.Length > 64 || dns.SessionId.Length > 32 || dns.Generation.Length > 32 ||
+            (dns.Ready && (!dns.Enabled || !IsWireGuid(dns.SessionId) || !IsWireGuid(dns.Generation))))) return false;
         if (snapshot.Apps.Count > 1024) return false;
         var paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var pids = new HashSet<uint>();
@@ -23,4 +25,6 @@ public static class SnapshotValidator
         }
         return true;
     }
+
+    internal static bool IsWireGuid(string value) => value.Length == 32 && Guid.TryParseExact(value, "N", out var guid) && guid != Guid.Empty && value == guid.ToString("N");
 }

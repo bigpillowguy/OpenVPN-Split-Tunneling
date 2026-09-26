@@ -35,6 +35,9 @@
     <Compile Include="../VpnClient.Ui/WindowsCommandLine.cs" Link="Production/WindowsCommandLine.cs" />
     <Compile Include="../VpnClient.Ui/LoopbackPeer.cs" Link="Production/LoopbackPeer.cs" />
     <Compile Include="../VpnClient.Ui/Redirector.cs" Link="Production/Redirector.cs" />
+    <Compile Include="../VpnClient.Ui/ExperimentalDnsController.cs" Link="Production/ExperimentalDnsController.cs" />
+    <Compile Include="../VpnClient.Ui/ExperimentalDnsReadiness.cs" Link="Production/ExperimentalDnsReadiness.cs" />
+    <Compile Include="../VpnClient.Ui/DnsGuardClient.cs" Link="Production/DnsGuardClient.cs" />
     <Compile Include="../VpnClient.Ui/JobManager.cs" Link="Production/JobManager.cs" />
     <Protobuf Include="../../ipc/proto/status.proto" GrpcServices="None" ProtoRoot="../../ipc/proto" />
   </ItemGroup>

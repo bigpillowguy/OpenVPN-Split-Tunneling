@@ -127,6 +127,42 @@ public class SessionControllerTests
         Assert.Equal(VpnConnectionState.Disconnected, controller.State);
     }
 
+    [Fact]
+    public async Task DnsRestorationCompletesBeforeOwnedVpnStops()
+    {
+        var restoring = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var restored = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var session = new FakeSession();
+        var controller = new VpnSessionController(_ => session, beforeSessionStop: async () =>
+        { restoring.TrySetResult(); await restored.Task; });
+        await controller.ConnectAsync(new OvpnEntry());
+        var stop = controller.DisconnectAsync();
+        await restoring.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal(0, session.Stops);
+        Assert.True(controller.HasSession);
+        restored.SetResult();
+        await stop;
+        Assert.Equal(1, session.Stops);
+        Assert.True(session.Disposed);
+    }
+
+    [Fact]
+    public async Task FailedDnsRestorationRetainsVpnOwnershipForRetry()
+    {
+        var blocked = true;
+        var session = new FakeSession();
+        var controller = new VpnSessionController(_ => session, beforeSessionStop: () =>
+            blocked ? Task.FromException(new IOException("DNS recovery required")) : Task.CompletedTask);
+        await controller.ConnectAsync(new OvpnEntry());
+        await Assert.ThrowsAsync<IOException>(controller.DisconnectAsync);
+        Assert.Equal(0, session.Stops);
+        Assert.False(session.Disposed);
+        Assert.True(controller.HasSession);
+        blocked = false;
+        await controller.DisconnectAsync();
+        Assert.Equal(1, session.Stops);
+    }
+
     private sealed class FakeSession : IVpnSession
     {
         public event EventHandler<bool>? ConnectionChanged;

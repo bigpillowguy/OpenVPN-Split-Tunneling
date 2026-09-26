@@ -18,6 +18,16 @@ public static class Redirector
 
     public static string? Failure => _failure;
     public static string? LogPath { get; private set; }
+    public static bool SplitDnsMode { get; private set; }
+    internal static VpnSessionBinding? SessionBinding => _sessionBindings?.Current;
+    internal static DnsProcessIdentity? Identity
+    {
+        get
+        {
+            try { return _process is { HasExited: false } p ? new(checked((uint)p.Id), checked((ulong)p.StartTime.ToFileTimeUtc())) : null; }
+            catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception) { return null; }
+        }
+    }
     public static event EventHandler? StateChanged;
     public static bool IsRunning
     {
@@ -41,7 +51,7 @@ public static class Redirector
         catch (InvalidOperationException) { return false; }
     }
 
-    public static void Start()
+    public static void Start(bool splitDns = false)
     {
         _stopping = false;
         _failure = null;
@@ -52,11 +62,14 @@ public static class Redirector
             UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = Path.GetDirectoryName(path),
         };
         start.ArgumentList.Add("observe");
+        AddSplitDnsArgument(start, splitDns);
+        SplitDnsMode = splitDns;
         var eventName = @"Local\VpnClient-" + Guid.NewGuid().ToString("N");
         _shutdown = new EventWaitHandle(false, EventResetMode.ManualReset, eventName);
         start.ArgumentList.Add("--shutdown-event");
         start.ArgumentList.Add(eventName);
         _sessionBindings = new VpnSessionBindingStore();
+        _sessionBindings.SnapshotChanged += (_, _) => StateChanged?.Invoke(null, EventArgs.Empty);
         start.ArgumentList.Add("--session-file");
         start.ArgumentList.Add(_sessionBindings.FilePath);
         LogPath = Path.Combine(Path.GetDirectoryName(_sessionBindings.FilePath)!, "redirector.log");
@@ -76,6 +89,11 @@ public static class Redirector
             _sessionBindings.Dispose(); _sessionBindings = null;
             throw new InvalidOperationException(_failure, ex);
         }
+    }
+
+    internal static void AddSplitDnsArgument(ProcessStartInfo start, bool enabled)
+    {
+        if (enabled) start.ArgumentList.Add("--split-dns");
     }
 
     public static string? FindBinary(string baseDirectory)

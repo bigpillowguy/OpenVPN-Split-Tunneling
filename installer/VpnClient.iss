@@ -2,20 +2,21 @@
 ;
 ; Use installer/build.ps1 to build, validate dependencies and compile this script.
 ;
-; Output:  installer\Output\VpnClientSetup-1.2.0.exe
+; Output:  installer\Output\VpnClientSetup-1.3.1.exe
 
 #if VER < EncodeVer(6, 7, 0)
   #error "Inno Setup 6.7 or newer is required"
 #endif
 
 #define MyAppName      "OpenVPN Split Tunneling Client"
-#define MyAppVersion   "1.2.0"
+#define MyAppVersion   "1.3.1"
 #define MyAppPublisher "ena"
 #define MyAppExeName   "VpnClient.Ui.exe"
 #define MyAppId        "{{A6A4F2D2-6E1E-4D6F-A2D6-9E1F7B3B8FCC}"
 
 #define UiPublishDir   "..\dotnet\VpnClient.Ui\bin\Release\net8.0-windows10.0.19041.0\win-x64\publish"
 #define RedirectorDir  "..\target\release"
+#define DnsGuardDir    "..\dotnet\VpnClient.DnsGuard\bin\Release\net8.0-windows\win-x64\publish"
 #define OpenVpnVersion "2.7.4-I001"
 #define OpenVpnMsi     "OpenVPN-" + OpenVpnVersion + "-amd64.msi"
 
@@ -57,6 +58,9 @@ Source: "{#UiPublishDir}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversio
 Source: "{#RedirectorDir}\redirector.exe";   DestDir: "{app}"; Flags: ignoreversion
 Source: "{#RedirectorDir}\WinDivert.dll";    DestDir: "{app}"; Flags: ignoreversion
 Source: "{#RedirectorDir}\WinDivert64.sys";  DestDir: "{app}"; Flags: ignoreversion
+; The LocalSystem recovery service uses a normal self-contained directory. Its
+; runtime libraries must not be extracted to a user-writable temporary folder.
+Source: "{#DnsGuardDir}\*"; DestDir: "{app}\DnsGuard"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "licenses\*"; DestDir: "{app}\licenses"; Flags: ignoreversion
 Source: "..\vendor\windivert\LICENSE"; DestDir: "{app}\licenses"; DestName: "WinDivert-LICENSE.txt"; Flags: ignoreversion
@@ -80,6 +84,52 @@ Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: sh
 [Code]
 var
   PrerequisiteNeedsRestart: Boolean;
+  DnsMaintenanceStarted: Boolean;
+
+function InstallerProcessId: DWORD;
+  external 'GetCurrentProcessId@kernel32.dll stdcall';
+
+function PrepareDnsGuardForMaintenance: String;
+var
+  GuardPath: String;
+  ResultCode: Integer;
+begin
+  Result := '';
+  GuardPath := ExpandConstant('{app}\DnsGuard\VpnClient.DnsGuard.exe');
+  if not FileExists(GuardPath) then begin
+    if RegKeyExists(HKLM64, 'SYSTEM\CurrentControlSet\Services\VpnClientDnsGuard') then
+      Result := 'The DNS recovery service is registered, but its installed helper is missing. ' +
+        'Repair the existing installation and restore DNS before replacing or removing the client.';
+    exit;
+  end;
+  DnsMaintenanceStarted := True;
+  if not Exec(GuardPath, 'uninstall --maintenance-owner ' + IntToStr(InstallerProcessId),
+      '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then begin
+    Result := 'The DNS recovery helper could not start (Windows error ' + IntToStr(ResultCode) + ').';
+    exit;
+  end;
+  if ResultCode <> 0 then
+    Result := 'The DNS recovery helper refused maintenance (code ' + IntToStr(ResultCode) + '). ' +
+      'Close the VPN client and let DNS restoration finish, then retry. ' +
+      'If recovery is required, keep this installation in place and run DnsGuard\VpnClient.DnsGuard.exe inspect as administrator.';
+end;
+
+procedure CompleteDnsMaintenance;
+var
+  GuardPath: String;
+  ResultCode: Integer;
+begin
+  if not DnsMaintenanceStarted then exit;
+  GuardPath := ExpandConstant('{app}\DnsGuard\VpnClient.DnsGuard.exe');
+  if FileExists(GuardPath) then begin
+    if not Exec(GuardPath, 'maintenance-complete --maintenance-owner ' + IntToStr(InstallerProcessId),
+        '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+      Log('Could not clear the DNS maintenance marker; it will expire with this installer process.')
+    else if ResultCode <> 0 then
+      Log('DNS maintenance marker cleanup returned ' + IntToStr(ResultCode) + '; it will expire with this installer process.');
+  end;
+  DnsMaintenanceStarted := False;
+end;
 
 function ProbeOpenExistingFile(const FileName: String; DesiredAccess, ShareMode: DWORD;
   SecurityAttributes: THandle; CreationDisposition, FlagsAndAttributes: DWORD;
@@ -186,6 +236,8 @@ begin
   // Keep CloseApplicationsFilter narrow: never silently close arbitrary user apps.
   Result := CheckLegacyFilesForRemoval;
   if Result <> '' then exit;
+  Result := PrepareDnsGuardForMaintenance;
+  if Result <> '' then exit;
   if OpenVpnInstalled then exit;
   ExtractTemporaryFile('{#OpenVpnMsi}');
   MsiPath := ExpandConstant('{tmp}\{#OpenVpnMsi}');
@@ -214,6 +266,31 @@ begin
     // legacy components cause an actionable refusal, including silent installs.
     RetireLegacyFiles;
   end;
+  if CurStep = ssPostInstall then CompleteDnsMaintenance;
+end;
+
+procedure DeinitializeSetup;
+begin
+  CompleteDnsMaintenance;
+end;
+
+function InitializeUninstall: Boolean;
+var
+  ErrorMessage: String;
+begin
+  ErrorMessage := PrepareDnsGuardForMaintenance;
+  Result := ErrorMessage = '';
+  if not Result then begin
+    if not UninstallSilent then MsgBox(ErrorMessage, mbError, MB_OK);
+    CompleteDnsMaintenance;
+  end;
+end;
+
+procedure DeinitializeUninstall;
+begin
+  // On successful removal the helper is gone; its protected marker becomes
+  // stale when this exact installer process exits. No service refers to it.
+  CompleteDnsMaintenance;
 end;
 
 function NeedRestart: Boolean;

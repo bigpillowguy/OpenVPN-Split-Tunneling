@@ -1,10 +1,12 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.Diagnostics;
 using System.Linq;
 using System.Windows;
 using System.Windows.Media;
 using System.ComponentModel;
+using System.Windows.Threading;
 using MessageBoxButton = System.Windows.MessageBoxButton;
 using Vpnclient.Status;
 using Wpf.Ui.Controls;
@@ -16,6 +18,9 @@ public partial class MainWindow : FluentWindow
     private readonly StatusClient _statusClient = new();
     private Config _config = Config.Load();
     private readonly ObservableCollection<AppRow> _appRows = new();
+    private readonly DispatcherTimer _dnsTimer = new() { Interval = TimeSpan.FromMilliseconds(500) };
+    private long _snapshotReceivedAt;
+    private bool _dnsInitialized, _dnsToggleBusy, _dnsPollBusy;
 
     public MainWindow()
     {
@@ -24,15 +29,27 @@ public partial class MainWindow : FluentWindow
         _statusClient.ConnectionChanged += OnConnectionChanged;
         App.Connector.StateChanged += OnVpnStateChanged;
         Redirector.StateChanged += OnVpnStateChanged;
-        Loaded += (_, _) => {
+        App.ExperimentalDns.StateChanged += OnDnsStateChanged;
+        _dnsTimer.Tick += async (_, _) =>
+        {
+            if (_dnsPollBusy || _closing) return;
+            _dnsPollBusy = true;
+            try { ObserveDnsReadiness(); await App.ExperimentalDns.CheckFreshnessAsync(); }
+            finally { _dnsPollBusy = false; }
+        };
+        Loaded += async (_, _) => {
             _statusClient.Start();
             RefreshAppList();
             RefreshConnectionState();
             if (_config.LoadWarning is { } warning)
                 System.Windows.MessageBox.Show(warning, "Configuration recovery", MessageBoxButton.OK, MessageBoxImage.Warning);
+            await App.ExperimentalDns.InitializeAsync(_config.ExperimentalSplitDns);
+            _dnsInitialized = true;
+            _dnsTimer.Start();
+            RefreshConnectionState();
         };
         Closing += OnClosing;
-        Closed += (_, _) => { _statusClient.Stop(); App.Connector.StateChanged -= OnVpnStateChanged; Redirector.StateChanged -= OnVpnStateChanged; };
+        Closed += (_, _) => { _dnsTimer.Stop(); _statusClient.Stop(); App.Connector.StateChanged -= OnVpnStateChanged; Redirector.StateChanged -= OnVpnStateChanged; App.ExperimentalDns.StateChanged -= OnDnsStateChanged; };
     }
 
     private bool _redirectorConnected;
@@ -44,9 +61,17 @@ public partial class MainWindow : FluentWindow
     {
         if (_allowClose) return;
         e.Cancel = true;
-        if (_closing) return;
+        if (_closing || _dnsToggleBusy || !_dnsInitialized) return;
         _closing = true;
         RefreshConnectionState();
+        try { await App.ExperimentalDns.PauseAsync(); }
+        catch (Exception ex)
+        {
+            _closing = false;
+            System.Windows.MessageBox.Show(ex.Message, "DNS restoration needs attention", MessageBoxButton.OK, MessageBoxImage.Error);
+            RefreshConnectionState();
+            return;
+        }
         try { await App.Connector.DisconnectAsync(); }
         catch { /* OnExit closes the owned Job even if graceful shutdown failed. */ }
         try { await Redirector.StopAsync(); }
@@ -56,6 +81,7 @@ public partial class MainWindow : FluentWindow
     }
 
     private void OnVpnStateChanged(object? sender, EventArgs e) => Dispatcher.BeginInvoke(RefreshConnectionState);
+    private void OnDnsStateChanged(object? sender, EventArgs e) => Dispatcher.BeginInvoke(RefreshConnectionState);
 
     private void OnConnectionChanged(object? sender, bool connected)
     {
@@ -69,9 +95,11 @@ public partial class MainWindow : FluentWindow
 
     private void OnSnapshot(object? sender, Snapshot snapshot)
     {
+        var receivedAt = Stopwatch.GetTimestamp();
         Dispatcher.BeginInvoke(() =>
         {
             _snapshot = snapshot;
+            _snapshotReceivedAt = receivedAt;
             RefreshConnectionState();
 
             var totals = snapshot.Totals;
@@ -154,6 +182,54 @@ public partial class MainWindow : FluentWindow
         ConnectBtn.Appearance = canStop ? ControlAppearance.Secondary : ControlAppearance.Primary;
         ConnectBtn.IsEnabled = !_closing && connector.State != VpnConnectionState.Disconnecting && (canStop || _config.OvpnFiles.Count > 0);
         ConnectBtn.ToolTip = canStop ? "Stop this VPN session" : "Connect using the selected profile";
+        ConnectBtn.IsEnabled &= !_dnsToggleBusy;
+        VpnSettingsBtn.IsEnabled = ManageAppsBtn.IsEnabled = !_closing && !_dnsToggleBusy;
+        ExperimentalDnsToggle.IsChecked = _config.ExperimentalSplitDns;
+        ExperimentalDnsToggle.IsEnabled = _dnsInitialized && !_closing && !_dnsToggleBusy && !connector.HasSession && !busy;
+        ExperimentalDnsToggle.ToolTip = connector.HasSession || busy ? "Disconnect the VPN first. Changing this setting restarts the backend." : "Changing this setting restarts the backend; applications are started normally.";
+        ExperimentalDnsText.Text = _dnsToggleBusy ? "Restoring DNS and restarting the backend…" : App.ExperimentalDns.Detail +
+            ExperimentalDnsDiagnostics.Format(_snapshot?.SplitDns, App.ExperimentalDns.State == ExperimentalDnsState.Active,
+                _redirectorConnected && Stopwatch.GetElapsedTime(_snapshotReceivedAt) <= TimeSpan.FromSeconds(2));
+        ObserveDnsReadiness();
+    }
+
+    private void ObserveDnsReadiness()
+    {
+        if (!_dnsInitialized) return;
+        var current = !_closing && !_dnsToggleBusy && _redirectorConnected &&
+            Stopwatch.GetElapsedTime(_snapshotReceivedAt) <= TimeSpan.FromSeconds(2) && App.Connector.State == VpnConnectionState.Connected;
+        var target = ExperimentalDnsReadiness.Evaluate(current, Redirector.SplitDnsMode, _snapshot, Redirector.SessionBinding, Redirector.Identity);
+        _ = App.ExperimentalDns.ObserveAsync(target);
+    }
+
+    private async void ExperimentalDnsToggle_Click(object sender, RoutedEventArgs e)
+    {
+        var enabled = ExperimentalDnsToggle.IsChecked == true;
+        if (_dnsToggleBusy || !_dnsInitialized || App.Connector.HasSession || App.Connector.State is VpnConnectionState.Connecting or VpnConnectionState.Disconnecting)
+        { RefreshConnectionState(); return; }
+        _dnsToggleBusy = true;
+        var previous = _config.ExperimentalSplitDns;
+        RefreshConnectionState();
+        try
+        {
+            await App.ExperimentalDns.PauseAsync();
+            await App.ExperimentalDns.SetEnabledAsync(false);
+            await Redirector.StopAsync();
+            Redirector.Dispose();
+            _snapshot = null; _redirectorConnected = false;
+            _config.ExperimentalSplitDns = enabled;
+            _config.Save();
+            Redirector.Start(enabled);
+            await App.ExperimentalDns.SetEnabledAsync(enabled);
+            await App.ExperimentalDns.ResumeAsync();
+        }
+        catch (Exception ex)
+        {
+            _config.ExperimentalSplitDns = previous;
+            try { _config.Save(); } catch { }
+            System.Windows.MessageBox.Show(ex.Message + "\nRestart the client if its backend is unavailable.", "Experimental DNS setting", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+        finally { _dnsToggleBusy = false; RefreshConnectionState(); }
     }
 
     private OvpnEntry? ResolveActiveProfile()
@@ -173,7 +249,10 @@ public partial class MainWindow : FluentWindow
             if (App.Connector.HasSession || App.Connector.State == VpnConnectionState.Connecting)
                 await App.Connector.DisconnectAsync();
             else if (ResolveActiveProfile() is { } profile)
+            {
                 await App.Connector.ConnectAsync(profile);
+                await App.ExperimentalDns.ResumeAsync();
+            }
         }
         catch (Exception ex)
         {

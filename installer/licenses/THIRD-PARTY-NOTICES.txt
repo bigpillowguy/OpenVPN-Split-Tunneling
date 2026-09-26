@@ -32,8 +32,11 @@ Package: https://swupdate.openvpn.org/community/releases/OpenVPN-2.7.4-I001-amd6
 
 The application also uses Rust crates and .NET libraries. Their versions and
 license declarations can be inspected with cargo metadata --locked and the
-NuGet package metadata referenced by dotnet/VpnClient.Ui/VpnClient.Ui.csproj.
+NuGet package metadata referenced by dotnet/VpnClient.Ui/VpnClient.Ui.csproj
+and dotnet/VpnClient.DnsGuard/VpnClient.DnsGuard.csproj.
 Principal components include smoltcp, Tokio, Prost, windows-rs, sysinfo,
-WinDivert Rust bindings, WPF-UI, Google.Protobuf, and the Microsoft .NET runtime.
+WinDivert Rust bindings, WPF-UI, Google.Protobuf, System.Management, and the
+Microsoft .NET runtime. The DNS guard is an original MIT-licensed implementation;
+no PIA source code is included.
 Source for this client, Cargo.lock and build scripts:
 https://github.com/bigpillowguy/OpenVPN-Split-Tunneling

@@ -30,7 +30,7 @@ try {
         if (-not $vs) { throw 'Visual Studio MSVC x64/x86 build tools were not found.' }
         & dotnet --version
         if ($LASTEXITCODE -ne 0) { throw 'Install the .NET SDK required by global.json.' }
-        Write-Host '[1/3] Building redirector' -ForegroundColor Cyan
+        Write-Host '[1/4] Building redirector' -ForegroundColor Cyan
         $cargoOutput = & cargo build --locked --release --manifest-path redirector/Cargo.toml --message-format=json-render-diagnostics
         if ($LASTEXITCODE -ne 0) { throw 'cargo build failed (check MSVC and Windows SDK installation)' }
         $artifact = $cargoOutput | ForEach-Object { $_ | ConvertFrom-Json } |
@@ -40,12 +40,18 @@ try {
         if (-not $artifact -or [IO.Path]::GetFullPath($artifact.executable) -ne $expectedBinary) {
             throw 'Cargo output was redirected by a target or target-dir override. Remove that override before packaging; no previous target/release binary will be packaged.'
         }
-        Write-Host '[2/3] Publishing UI' -ForegroundColor Cyan
+        Write-Host '[2/4] Publishing UI' -ForegroundColor Cyan
         $uiPublish = Join-Path $root 'dotnet\VpnClient.Ui\bin\Release\net8.0-windows10.0.19041.0\win-x64\publish'
         & dotnet restore dotnet/VpnClient.Ui/VpnClient.Ui.csproj --locked-mode
         if ($LASTEXITCODE -ne 0) { throw 'Locked NuGet restore failed; review the package references and lockfile.' }
         & dotnet publish dotnet/VpnClient.Ui/VpnClient.Ui.csproj -c Release --nologo --no-restore -o $uiPublish
         if ($LASTEXITCODE -ne 0) { throw 'dotnet publish failed' }
+        Write-Host '[3/4] Publishing DNS recovery service' -ForegroundColor Cyan
+        $guardPublish = Join-Path $root 'dotnet\VpnClient.DnsGuard\bin\Release\net8.0-windows\win-x64\publish'
+        & dotnet restore dotnet/VpnClient.DnsGuard/VpnClient.DnsGuard.csproj --locked-mode
+        if ($LASTEXITCODE -ne 0) { throw 'Locked DNS guard restore failed.' }
+        & dotnet publish dotnet/VpnClient.DnsGuard/VpnClient.DnsGuard.csproj -c Release --nologo --no-restore -o $guardPublish
+        if ($LASTEXITCODE -ne 0) { throw 'DNS guard publish failed.' }
     }
 
     # Do not package stale native dependencies even when -SkipBuild is used.
@@ -58,7 +64,7 @@ try {
         }
     }
     Get-OpenVpnPackage (Join-Path $PSScriptRoot "deps\$OpenVpnMsiName")
-    Write-Host '[3/3] Compiling installer' -ForegroundColor Cyan
+    Write-Host '[4/4] Compiling installer' -ForegroundColor Cyan
     & $iscc "$PSScriptRoot\VpnClient.iss"
     if ($LASTEXITCODE -ne 0) { throw 'Inno Setup compilation failed' }
     Write-Host 'Installer built in installer/Output.' -ForegroundColor Green

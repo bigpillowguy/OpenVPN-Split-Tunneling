@@ -1,6 +1,11 @@
 # Windows VPN Platform: per-EXE DNS scope investigation
 
-Status, 2026-09-26: **active platform investigation; live VPN-platform result pending**.
+Status, 2026-09-26: **paused while the PIA-style alternative is implemented; no live VPN-platform verdict**.
+The user selected the previously reserved DNS Client replacement approach.
+This fixture is retained for future investigation; its offline results do not
+establish a runtime success or failure. The disposable VM did not reach a verified
+desktop/Tools/baseline snapshot and its VMX/VMDK subsequently disappeared from
+the prepared directory. No package or VPN profile was activated there.
 This directory is independent of the shipping UI, redirector and installer.
 CI builds and validates it offline; CI never registers or connects the VPN.
 No package was registered, no certificate was created/trusted, and no VPN/DNS

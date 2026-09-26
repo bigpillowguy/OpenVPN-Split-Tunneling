@@ -27,11 +27,13 @@ public class VpnSessionController
     private long _request;
     private IVpnSession? _session;
     private readonly TimeSpan _connectionTimeout;
+    private readonly Func<Task>? _beforeSessionStop;
 
-    public VpnSessionController(Func<OvpnEntry, IVpnSession> createSession, TimeSpan? connectionTimeout = null)
+    public VpnSessionController(Func<OvpnEntry, IVpnSession> createSession, TimeSpan? connectionTimeout = null, Func<Task>? beforeSessionStop = null)
     {
         _createSession = createSession;
         _connectionTimeout = connectionTimeout ?? TimeSpan.FromSeconds(30);
+        _beforeSessionStop = beforeSessionStop;
     }
     public VpnConnectionState State { get; private set; }
     public string? ActiveProfileId { get; private set; }
@@ -127,6 +129,7 @@ public class VpnSessionController
     private async Task StopOwnedSessionAsync()
     {
         if (_session is not { } session) { ActiveProfileId = null; return; }
+        if (_beforeSessionStop is not null) await _beforeSessionStop().ConfigureAwait(false);
         // Retain a session when stop fails: Retry/Stop must still own its process.
         await session.StopAsync().ConfigureAwait(false);
         session.ConnectionChanged -= OnSessionConnectionChanged;

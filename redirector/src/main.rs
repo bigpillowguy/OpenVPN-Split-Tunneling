@@ -11,6 +11,7 @@ mod proc_watcher;
 mod process;
 mod session_binding;
 mod shutdown;
+mod split_dns;
 mod stack;
 mod status_server;
 mod tunneled;
@@ -59,6 +60,7 @@ struct ObserveOptions<'a> {
     shutdown_event: Option<&'a str>,
     session_file: &'a std::path::Path,
     dns_pipe: Option<&'a str>,
+    split_dns: bool,
 }
 
 fn observe_options(args: &[String]) -> Result<ObserveOptions<'_>> {
@@ -66,7 +68,16 @@ fn observe_options(args: &[String]) -> Result<ObserveOptions<'_>> {
     let mut session_file = None;
     let mut seen_log_file = false;
     let mut dns_pipe = None;
-    for pair in args.chunks(2) {
+    let mut split_dns = false;
+    let mut at = 0;
+    while at < args.len() {
+        if args[at] == "--split-dns" {
+            anyhow::ensure!(!split_dns, "duplicate --split-dns");
+            split_dns = true;
+            at += 1;
+            continue;
+        }
+        let pair = &args[at..(at + 2).min(args.len())];
         match pair {
             [flag, value] if flag == "--dns-pipe" && dns_pipe.is_none() => {
                 dns_broker::pipe_path(value)?;
@@ -83,13 +94,15 @@ fn observe_options(args: &[String]) -> Result<ObserveOptions<'_>> {
                 seen_log_file = true;
             }
             _ => anyhow::bail!(
-                "usage: redirector observe --session-file PATH [--shutdown-event NAME] [--log-file PATH] [--dns-pipe NAME]"
+                "usage: redirector observe --session-file PATH [--shutdown-event NAME] [--log-file PATH] [--dns-pipe NAME] [--split-dns]"
             ),
         }
+        at += 2;
     }
     Ok(ObserveOptions {
         shutdown_event,
         dns_pipe,
+        split_dns,
         session_file: session_file.ok_or_else(|| {
             anyhow::anyhow!("observe requires --session-file from the UI's current OpenVPN session")
         })?,
@@ -132,7 +145,7 @@ fn run_observe(options: ObserveOptions<'_>) -> Result<()> {
                 name.to_owned(),
                 resolver.clone(),
                 vpn_state.clone(),
-                session,
+                session.clone(),
                 shutdown.clone(),
             ));
         }
@@ -157,6 +170,14 @@ fn run_observe(options: ObserveOptions<'_>) -> Result<()> {
             let resolver = resolver.clone();
             let tunneled_paths = tunneled_paths.clone();
             let shutdown = shutdown.clone();
+            let dns = options.split_dns.then(|| {
+                Arc::new(split_dns::LiveAuthority::new(
+                    resolver.clone(),
+                    session.clone(),
+                    vpn_state.clone(),
+                    shutdown.clone(),
+                ))
+            });
             workers.spawn_blocking(move || {
                 divert::run(
                     policy_state,
@@ -166,6 +187,7 @@ fn run_observe(options: ObserveOptions<'_>) -> Result<()> {
                     resolver,
                     tunneled_paths,
                     shutdown,
+                    dns,
                 )
             });
         };
@@ -227,7 +249,7 @@ fn print_help() {
     println!();
     println!("USAGE:");
     println!("  redirector [adapters]    List network adapters, flag VPN candidates");
-    println!("  redirector observe --session-file PATH [--shutdown-event NAME] [--log-file PATH] [--dns-pipe NAME]");
+    println!("  redirector observe --session-file PATH [--shutdown-event NAME] [--log-file PATH] [--dns-pipe NAME] [--split-dns]");
     println!(
         "                          Run routing for the UI's bound VPN session (requires admin)"
     );
@@ -294,6 +316,7 @@ mod lifecycle_tests {
         ]
         .map(str::to_owned);
         let options = observe_options(&args).unwrap();
+        assert!(!options.split_dns);
         assert_eq!(options.session_file, std::path::Path::new(&args[1]));
         assert_eq!(options.shutdown_event, Some(args[3].as_str()));
         let duplicate = ["--session-file", "one", "--session-file", "two"].map(str::to_owned);
@@ -310,6 +333,12 @@ mod lifecycle_tests {
         let mut duplicated_log = logged.to_vec();
         duplicated_log.extend(["--log-file".into(), "C:\\private\\another.log".into()]);
         assert!(observe_options(&duplicated_log).is_err());
+        let split =
+            ["--split-dns", "--session-file", "C:\\private\\session.json"].map(str::to_owned);
+        assert!(observe_options(&split).unwrap().split_dns);
+        let mut duplicate_split = split.to_vec();
+        duplicate_split.push("--split-dns".into());
+        assert!(observe_options(&duplicate_split).is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -5,7 +5,7 @@ namespace VpnClient.Ui;
 
 public sealed class VpnConnector : VpnSessionController
 {
-    public VpnConnector() : base(profile => new OpenVpnSession(profile)) { }
+    public VpnConnector() : base(profile => new OpenVpnSession(profile), beforeSessionStop: () => App.ExperimentalDns.PauseAsync()) { }
 
     public static string? FindOpenVpn()
     {

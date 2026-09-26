@@ -2,12 +2,19 @@ using System.Windows;
 using System;
 using System.Security.Principal;
 using System.Threading;
+using System.Diagnostics;
 
 namespace VpnClient.Ui;
 
 public partial class App : Application
 {
     public static VpnConnector Connector { get; } = new VpnConnector();
+    internal static ExperimentalDnsController ExperimentalDns { get; } = CreateDnsController();
+    private static ExperimentalDnsController CreateDnsController()
+    {
+        using var owner = Process.GetCurrentProcess();
+        return new(new DnsGuardClient(AppContext.BaseDirectory), new(checked((uint)owner.Id), checked((ulong)owner.StartTime.ToFileTimeUtc())));
+    }
     private Mutex? _instance;
     private bool _ownsInstance;
 
@@ -34,7 +41,7 @@ public partial class App : Application
                 // unrecoverable input refuses Save and leaves the original file untouched.
                 config.Save();
             }
-            Redirector.Start();
+            Redirector.Start(config.ExperimentalSplitDns);
         }
         catch (Exception ex)
         {

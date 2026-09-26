@@ -345,6 +345,7 @@ async fn dropping_udp_flow_aborts_worker_and_releases_socket() {
         creation_time: 0,
         app_endpoint: (Ipv4Addr::LOCALHOST, 40000),
         original_dst: (Ipv4Addr::LOCALHOST, dst.port()),
+        dns: None,
         app_to_remote: tx,
         remote_to_app: rx,
         last_active: Instant::now(),
@@ -377,12 +378,15 @@ fn pending_flow(sockets: &mut SocketSet<'static>, since: Instant) -> (TcpKey, Tc
         TcpKey {
             src_ip: Ipv4Addr::LOCALHOST,
             src_port: 40000,
+            dst_ip: Ipv4Addr::LOCALHOST,
+            dst_port: 443,
         },
         TcpFlow {
             handle,
             pid: TEST_PID,
             creation_time: 0,
             original_dst: "127.0.0.1:443".parse().unwrap(),
+            dns: None,
             state: TcpState::Pending { since },
             task: None,
         },
@@ -558,11 +562,14 @@ fn tcp_request(port: u16, initial_syn: bool) -> TcpRequest {
         key: TcpKey {
             src_ip: Ipv4Addr::new(10, 0, 0, 1),
             src_port: port,
+            dst_ip: Ipv4Addr::new(10, 0, 0, 2),
+            dst_port: 443,
         },
         pid: TEST_PID,
         creation_time: 0,
         destination: SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 443),
         initial_syn,
+        dns: None,
     }
 }
 
@@ -655,6 +662,7 @@ async fn udp_capacity_rejects_new_worker_and_keeps_existing_flow() {
         pid: TEST_PID,
         creation_time: 0,
         target: None,
+        dns: None,
     };
     assert!(ensure_udp_flow(&mut flows, request(40000), &runtime, &stats, 1).is_some());
     assert!(ensure_udp_flow(&mut flows, request(40001), &runtime, &stats, 1).is_none());
@@ -664,4 +672,206 @@ async fn udp_capacity_rejects_new_worker_and_keeps_existing_flow() {
     flows.clear();
     assert!(ensure_udp_flow(&mut flows, request(40001), &runtime, &stats, 1).is_some());
     assert_eq!(stats.bridges_opened.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn selected_dns_midstream_is_dropped_and_tcp_keys_include_original_destination() {
+    let (permit, _) = crate::split_dns::tests::permit();
+    let mut request = tcp_request(40000, false);
+    request.dns = Some(permit.clone());
+    let mut flows = HashMap::new();
+    let mut sockets = SocketSet::new(Vec::new());
+    assert_eq!(
+        ensure_tcp_flow(&mut flows, &mut sockets, request, 2),
+        TcpAdmission::Drop
+    );
+    assert!(flows.is_empty());
+    let mut first = tcp_request(40000, true);
+    first.dns = Some(permit.clone());
+    let mut second = tcp_request(40000, true);
+    second.dns = Some(permit);
+    second.destination = "192.0.2.3:53".parse().unwrap();
+    second.key.dst_ip = *second.destination.ip();
+    second.key.dst_port = 53;
+    assert_eq!(
+        ensure_tcp_flow(&mut flows, &mut sockets, first, 2),
+        TcpAdmission::Tunnel
+    );
+    assert_eq!(
+        ensure_tcp_flow(&mut flows, &mut sockets, second, 2),
+        TcpAdmission::Tunnel
+    );
+    assert_eq!(flows.len(), 2);
+}
+
+#[test]
+fn udp_packet_length_is_bounded_and_reply_keeps_original_endpoint() {
+    let remote = Ipv4Addr::new(192, 0, 2, 53);
+    let app = Ipv4Addr::new(192, 0, 2, 10);
+    assert!(build_udp_packet(remote, 53, app, 40000, &vec![0; 65508]).is_none());
+    let packet = build_udp_packet(remote, 53, app, 40000, &vec![0; 65507]).unwrap();
+    assert_eq!(packet.len(), 65535);
+    assert_eq!(u16::from_be_bytes(packet[2..4].try_into().unwrap()), 65535);
+    assert!(
+        matches!(parse_ipv4_l4(&packet), Some(ParsedL4::Udp { src_ip, src_port:53, dst_ip, dst_port:40000 }) if src_ip == remote && dst_ip == app)
+    );
+}
+
+#[test]
+fn dns_generation_revoke_closes_only_dns_flows() {
+    let stats = stats();
+    let mut sockets = SocketSet::new(Vec::new());
+    let mut flows = HashMap::new();
+    let mut udp = HashMap::new();
+    let mut dns = tcp_request(40000, true);
+    dns.dns = Some(crate::split_dns::tests::permit().0);
+    let regular = tcp_request(40001, true);
+    assert_eq!(
+        ensure_tcp_flow(&mut flows, &mut sockets, dns, 10),
+        TcpAdmission::Tunnel
+    );
+    assert_eq!(
+        ensure_tcp_flow(&mut flows, &mut sockets, regular, 10),
+        TcpAdmission::Tunnel
+    );
+    remove_dns_flows(&mut flows, &mut udp, &mut sockets, &stats);
+    assert_eq!(flows.len(), 1);
+    assert_eq!(sockets.iter().count(), 1);
+    assert!(flows.values().all(|flow| flow.dns.is_none()));
+}
+
+fn permit_for(servers: Vec<SocketAddrV4>) -> (Permit, Arc<crate::split_dns::tests::TestAuthority>) {
+    let mut lease = crate::split_dns::tests::lease();
+    lease.dns.servers = servers;
+    let authority = Arc::new(crate::split_dns::tests::TestAuthority(
+        std::sync::Mutex::new(Some(lease.clone())),
+    ));
+    (Permit::new(lease, authority.clone()), authority)
+}
+
+#[tokio::test]
+async fn transparent_dns_udp_keeps_tc_and_original_client_id_and_address() {
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let SocketAddr::V4(endpoint) = server.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let tcp_trap = TcpListener::bind(endpoint).await.unwrap();
+    let (permit, _) = permit_for(vec![endpoint]);
+    let (tx, from_app) = mpsc::channel(2);
+    let (to_app, mut rx) = mpsc::channel(2);
+    let bridge = tokio::spawn(udp_dns_bridge_bound(
+        permit,
+        crate::dns_broker::transport::Binding::loopback(),
+        from_app,
+        to_app,
+    ));
+    let query = crate::dns_broker::wire::test_query();
+    tx.send(query.clone()).await.unwrap();
+    let mut packet = [0; 4096];
+    let (size, peer) = timeout(DEADLINE, server.recv_from(&mut packet))
+        .await
+        .unwrap()
+        .unwrap();
+    packet[2] |= 0x82; // QR + TC, no implicit TCP exchange by our UDP bridge.
+    server.send_to(&packet[..size], peer).await.unwrap();
+    let reply = timeout(DEADLINE, rx.recv()).await.unwrap().unwrap();
+    assert_eq!(&reply[..2], &query[..2]);
+    assert_ne!(reply[2] & 2, 0);
+    assert!(timeout(Duration::from_millis(50), tcp_trap.accept())
+        .await
+        .is_err());
+    let raw = build_udp_packet(
+        "192.0.2.53".parse().unwrap(),
+        53,
+        "192.0.2.10".parse().unwrap(),
+        40000,
+        &reply,
+    )
+    .unwrap();
+    assert_eq!(extract_udp_payload(&raw).unwrap(), reply);
+    assert!(
+        matches!(parse_ipv4_l4(&raw),Some(ParsedL4::Udp {src_ip,src_port:53,..}) if src_ip == Ipv4Addr::new(192,0,2,53))
+    );
+    drop(tx);
+    timeout(DEADLINE, bridge).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn dns_tcp_retries_only_provider_connects_and_preserves_framing_half_close() {
+    let closed = tokio::net::TcpSocket::new_v4().unwrap();
+    closed.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let SocketAddr::V4(first) = closed.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let SocketAddr::V4(second) = server.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let (permit, _) = permit_for(vec![first, second]);
+    let (tx, from_app) = mpsc::channel(8);
+    let (to_app, mut rx) = mpsc::channel(8);
+    let bridge = tokio::spawn(tcp_dns_bridge_bound(
+        permit,
+        crate::dns_broker::transport::Binding::loopback(),
+        from_app,
+        to_app,
+    ));
+    let query = crate::dns_broker::wire::test_query();
+    let mut framed = Vec::new();
+    for _ in 0..2 {
+        framed.extend_from_slice(&(query.len() as u16).to_be_bytes());
+        framed.extend_from_slice(&query);
+    }
+    for chunk in framed.chunks(11) {
+        tx.send(chunk.to_vec()).await.unwrap();
+    }
+    drop(tx);
+    let (mut stream, _) = timeout(DEADLINE, server.accept()).await.unwrap().unwrap();
+    let mut received = Vec::new();
+    timeout(DEADLINE, stream.read_to_end(&mut received))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(received, framed);
+    for chunk in received.chunks(7) {
+        stream.write_all(chunk).await.unwrap();
+    }
+    stream.shutdown().await.unwrap();
+    let mut result = Vec::new();
+    while let Some(chunk) = timeout(DEADLINE, rx.recv()).await.unwrap() {
+        result.extend(chunk);
+    }
+    assert_eq!(result, framed);
+    timeout(DEADLINE, bridge).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn dns_tcp_idle_revocation_closes_owned_socket() {
+    let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let SocketAddr::V4(endpoint) = server.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let (permit, authority) = permit_for(vec![endpoint]);
+    let (_tx, from_app) = mpsc::channel(1);
+    let (to_app, _rx) = mpsc::channel(1);
+    let bridge = tokio::spawn(tcp_dns_bridge_bound(
+        permit,
+        crate::dns_broker::transport::Binding::loopback(),
+        from_app,
+        to_app,
+    ));
+    let (mut stream, _) = timeout(DEADLINE, server.accept()).await.unwrap().unwrap();
+    *authority.0.lock().unwrap() = None;
+    assert!(timeout(Duration::from_secs(1), bridge)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_err());
+    assert_eq!(
+        timeout(DEADLINE, stream.read(&mut [0; 1]))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
 }

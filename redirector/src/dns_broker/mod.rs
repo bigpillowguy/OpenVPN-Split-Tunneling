@@ -2,8 +2,8 @@
 //! The UI does not start it; Windows VPN Platform integration is still research.
 //! No system resolver API, system cache, public resolver, or unbound fallback.
 mod security;
-mod transport;
-mod wire;
+pub(crate) mod transport;
+pub(crate) mod wire;
 
 use anyhow::Result;
 use std::path::Path;
