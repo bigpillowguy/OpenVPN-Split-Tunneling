@@ -3,14 +3,18 @@ using System.Collections.Generic;
 using System.IO;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Linq;
+using System.Text;
 
 namespace VpnClient.Ui;
 
 public class Config
 {
+    public int SchemaVersion { get; set; } = 1;
     public List<OvpnEntry> OvpnFiles { get; set; } = new();
     public string? ActiveOvpnId { get; set; }
     public List<AppEntry> TunneledApps { get; set; } = new();
+    public bool ExperimentalSplitDns { get; set; }
 
     [JsonIgnore]
     public static string AppDataDir =>
@@ -28,57 +32,111 @@ public class Config
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
     };
 
-    public static Config Load()
+    private string? _storagePath;
+    private bool _readFailed;
+    private bool _fromBackup;
+    [JsonIgnore] public string? LoadWarning { get; private set; }
+
+    public static Config Load(string? path = null)
     {
+        path ??= ConfigPath;
+        if (!File.Exists(path)) return new Config { _storagePath = path };
         try
         {
-            if (File.Exists(ConfigPath))
+            return Read(path, path);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or InvalidDataException or ArgumentException)
+        {
+            try
             {
-                var json = File.ReadAllText(ConfigPath);
-                var cfg = JsonSerializer.Deserialize<Config>(json, JsonOpts);
-                if (cfg is not null)
+                var restored = Read(path + ".bak", path);
+                restored._fromBackup = true;
+                restored.LoadWarning = "The configuration could not be read. The last backup was recovered; save a change to restore it.";
+                return restored;
+            }
+            catch (Exception backupError) when (backupError is IOException or UnauthorizedAccessException or JsonException or InvalidDataException or ArgumentException)
+            {
+                return new Config
                 {
-                    cfg.MigrateInPlace();
-                    return cfg;
-                }
+                    _storagePath = path, _readFailed = true,
+                    LoadWarning = $"Cannot read configuration or its backup. Your files were preserved. Restore {path} before saving changes. {ex.Message}",
+                };
             }
         }
-        catch (Exception ex)
-        {
-            // Bad config — start fresh, log to stderr for diagnostics
-            Console.Error.WriteLine($"config load failed: {ex.Message}");
-        }
-        return new Config();
     }
 
-    /// <summary>
-    /// Drop any legacy "host:port" stored under ServerHostname down to just the host.
-    /// We now display hostname-only to match OpenVPN Connect's convention.
-    /// </summary>
-    private void MigrateInPlace()
+    private static Config Read(string source, string destination)
     {
-        var dirty = false;
+        var config = JsonSerializer.Deserialize<Config>(File.ReadAllText(source), JsonOpts)
+            ?? throw new InvalidDataException("The configuration is null.");
+        config.Normalize();
+        config._storagePath = destination;
+        return config;
+    }
+
+    public static string NormalizeAppPath(string path) => Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
+    private void Normalize()
+    {
+        if (SchemaVersion > 1) throw new InvalidDataException("This configuration was written by a newer client.");
+        if (OvpnFiles is null || TunneledApps is null) throw new InvalidDataException("Configuration lists cannot be null.");
+        if (OvpnFiles.Any(entry => entry is null) || TunneledApps.Any(entry => entry is null))
+            throw new InvalidDataException("The configuration contains a null entry.");
         foreach (var entry in OvpnFiles)
         {
+            entry.ServerHostname ??= "";
+            entry.ServerOverride ??= "";
+            entry.Username ??= "";
+            entry.PasswordEncrypted ??= "";
+            entry.DisplayName ??= "";
+            entry.FilePath ??= "";
             var idx = entry.ServerHostname.IndexOf(':');
-            if (idx > 0)
+            // Only migrate unambiguous host:port; IPv6 addresses contain more than one colon.
+            if (idx > 0 && idx == entry.ServerHostname.LastIndexOf(':') &&
+                ushort.TryParse(entry.ServerHostname[(idx + 1)..], out _))
             {
                 entry.ServerHostname = entry.ServerHostname[..idx];
-                dirty = true;
             }
         }
-        if (dirty)
+        foreach (var entry in TunneledApps)
         {
-            try { Save(); } catch { }
+            if (string.IsNullOrWhiteSpace(entry.ExePath)) throw new InvalidDataException("An application path is empty.");
+            entry.ExePath = NormalizeAppPath(entry.ExePath);
         }
+        TunneledApps = TunneledApps.DistinctBy(entry => entry.ExePath, StringComparer.OrdinalIgnoreCase).ToList();
+        SchemaVersion = 1;
     }
 
     public void Save()
     {
-        Directory.CreateDirectory(AppDataDir);
-        Directory.CreateDirectory(OvpnDir);
-        var json = JsonSerializer.Serialize(this, JsonOpts);
-        File.WriteAllText(ConfigPath, json);
+        if (_readFailed) throw new InvalidOperationException(LoadWarning);
+        Normalize();
+        var path = _storagePath ?? ConfigPath;
+        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
+        var temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        try
+        {
+            using (var file = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            {
+                var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(this, JsonOpts));
+                file.Write(bytes);
+                file.Flush(flushToDisk: true);
+            }
+            if (File.Exists(path))
+            {
+                if (_fromBackup) File.Copy(path, path + ".corrupt-" + Guid.NewGuid().ToString("N"));
+                // Readers must retain their last valid snapshot across transient filesystem errors.
+                // A successfully opened version always contains the complete flushed JSON.
+                File.Replace(temporary, path, _fromBackup ? null : path + ".bak", ignoreMetadataErrors: true);
+            }
+            else File.Move(temporary, path);
+            _fromBackup = false;
+            LoadWarning = null;
+        }
+        finally
+        {
+            if (File.Exists(temporary)) File.Delete(temporary);
+        }
     }
 }
 

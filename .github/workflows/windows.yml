@@ -1,0 +1,70 @@
+name: Windows build and tests
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      - name: Install pinned Rust toolchain
+        run: |
+          $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "$env:USERPROFILE\.cargo\bin" >> $env:GITHUB_PATH
+      - name: Rust formatting
+        run: cargo fmt --all -- --check
+      - name: Rust clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Rust tests
+        run: cargo test --workspace --locked
+      - name: Native staging regression test
+        run: ./installer/test-native-staging.ps1
+      - name: .NET tests (no VPN or UI launch)
+        run: |
+          dotnet restore dotnet/VpnClient.Tests/VpnClient.Tests.csproj --locked-mode
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          dotnet test dotnet/VpnClient.Tests/VpnClient.Tests.csproj -c Release --nologo --no-restore
+      - name: Windows VPN Platform offline build and tests
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File research/VpnPlatform/build.ps1
+      - name: DNS diagnostic probe build and offline codec tests
+        run: ./research/DnsDiagnostics/Build.ps1 -RunCodecTests
+      - name: DNS recovery state tests (no service changes)
+        run: |
+          dotnet restore dotnet/VpnClient.DnsGuard.Tests/VpnClient.DnsGuard.Tests.csproj --locked-mode
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          dotnet test dotnet/VpnClient.DnsGuard.Tests/VpnClient.DnsGuard.Tests.csproj -c Release --nologo --no-restore
+      - name: Install Inno Setup compiler
+        run: |
+          $compiler = Join-Path $env:RUNNER_TEMP 'innosetup-6.7.3.exe'
+          Invoke-WebRequest 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe' -OutFile $compiler
+          if ((Get-FileHash $compiler -Algorithm SHA256).Hash -ne '9C73C3BAE7ED48D44112A0F48E66742C00090BDB5BEF71D9D3C056C66E97B732') { throw 'Inno Setup SHA-256 mismatch' }
+          if ((Get-AuthenticodeSignature $compiler).Status -ne 'Valid') { throw 'Inno Setup signature is invalid' }
+          $process = Start-Process $compiler -ArgumentList '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CURRENTUSER /SP-' -WindowStyle Hidden -PassThru -Wait
+          if ($process.ExitCode -ne 0) { throw "Inno Setup installation failed: $($process.ExitCode)" }
+      - name: Build and package (does not run setup)
+        run: ./installer/build.ps1
+      - name: Installer cache integrity tests
+        run: ./installer/test-dependencies.ps1
+      - name: Installer legacy component retirement tests
+        run: ./installer/test-legacy-retirement.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64-setup
+          path: installer/Output/VpnClientSetup-*.exe
+          if-no-files-found: error
+          retention-days: 14

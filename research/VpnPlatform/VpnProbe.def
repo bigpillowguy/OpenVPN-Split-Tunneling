@@ -1,0 +1,3 @@
+EXPORTS
+DllGetActivationFactory=ProbeGetActivationFactory PRIVATE
+DllCanUnloadNow=ProbeCanUnloadNow PRIVATE

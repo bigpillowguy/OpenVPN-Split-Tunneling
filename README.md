@@ -1,249 +1,287 @@
 # OpenVPN Split Tunneling Client
 
-Route specific Windows applications through an OpenVPN tunnel. Everything else
-stays on your regular default route.
+Choose Windows executable files whose IPv4 TCP and UDP traffic should use your
+OpenVPN connection. The WPF application starts OpenVPN and a Rust redirector;
+the redirector captures packets with WinDivert and forwards selected traffic
+through bridge sockets bound to the VPN interface.
 
-Built for the case where you want, say, your game launcher and the game
-itself to come out of a foreign IP — without bending your whole machine
-through the tunnel.
+This is a community client, not a VPN provider. Supply your own trusted `.ovpn`
+profile and any credentials required by your provider.
 
----
+## Supported behavior and limits
 
-## What it does
+- Selection matches an executable path. Add each executable you want to tunnel,
+  including games or helper programs launched by a selected launcher. Child
+  processes with different paths are not automatically selected.
+- Ordinary traffic forwarding covers IPv4 TCP/UDP. IPv6 and other protocols can use the normal
+  connection. Disabling IPv6 on the VPN profile alone does not stop IPv6 on the
+  physical interface.
+- The client is **fail-open**: when the VPN is unavailable, selected applications
+  may use the default route. This is not a kill switch or an anonymity boundary.
+- **DNS remains unchanged by default.** Version 1.3.3 includes an opt-in experimental
+  mode for ordinary IPv4 DNS on UDP/TCP port 53. It redirects selected executables'
+  queries to the current VPN provider's DNS through the VPN interface. This mode
+  temporarily replaces the shared Windows DNS Client service (`Dnscache`), which
+  affects system-wide caching and resolver behavior. It is not yet validated by
+  live packet captures or crash/reboot tests. See the limits below and
+  [DNS-RESEARCH.md](DNS-RESEARCH.md).
+- Each connection uses a temporary profile that suppresses local/pushed routes,
+  including `redirect-gateway` and IPv4 `/1` routes. The stored profile is preserved.
+  OpenVPN still configures its tunnel interface; the redirector prepares a route
+  through that interface with the session's reported gateway. Readiness requires
+  that preparation to succeed. Cleanup removes only an unchanged route created
+  by this redirector. Interface configuration can still create connected routes.
+- The target is the interface reported by this client's OpenVPN process, checked
+  against its process creation time, interface GUID/index and assigned IPv4 address.
+  Other active VPN adapters are not selected as a fallback. Reconnects revoke old
+  flows even when the new interface address and index are unchanged.
+- An application's existing connections may need to reconnect when policy or
+  VPN state changes. Select apps before starting their network activity.
+- Anti-cheat compatibility, packet reinjection behavior across Windows versions,
+  and gaming latency require testing with the actual application. Compatibility
+  with EAC, Vanguard or BattlEye is not guaranteed.
 
-Pick a list of `.exe`s. They (and any child processes they spawn) egress
-through your OpenVPN tunnel. Everything not on the list — your browser, your
-chat apps, Windows Update, Steam — keeps using your normal internet
-connection at full speed.
+The unit tests and build pipeline do not replace install/upgrade/uninstall and
+packet-capture acceptance tests on a disposable Windows machine. See
+[REVIEW.md](REVIEW.md) and [TODO.md](TODO.md) for the audit and verification plan.
 
-No system-wide routing changes. No "kill switch" required for unlisted apps.
-No DNS leaks for the apps you care about because they're pinned to the
-tunnel's adapter at the socket level (`IP_UNICAST_IF`), not the route
-table.
+The 1.3.1 live trial reached DNS mode activation but failed name resolution;
+turning the mode off restored ordinary DNS. Version 1.3.2 corrects the DNS reply
+injection direction and separates filter activation from the saved option.
+The 1.3.2 live comparison on Windows 11 build 26200.9457 confirmed that replacing
+Dnscache breaks ordinary Windows DNS APIs (RPC error 1722), even while direct
+UDP/TCP DNS queries work. Turning the mode off restored all tested API paths.
+Keep experimental DNS off on this configuration. This is an unresolved mechanism
+compatibility failure, not successful DNS isolation; see [VALIDATION.md](VALIDATION.md).
+Version 1.3.3 rejects experimental activation when the original Dnscache uses
+`OWN_PROCESS` (the configuration observed on this PC), before replacing the service.
+Recovery of older sessions is preserved. This prevents that unsafe activation;
+it does not provide per-app DNS on the rejected configuration, and does not prove
+that other Windows configurations are compatible.
 
-When the VPN goes down, listed apps fall back to the default route (fail-open)
-so they keep working — just without the tunnel.
+## Install and use
 
-## Who it's for
+The package targets **native x64 Windows 10 version 2004 (build 19041) or newer**,
+including Windows 11. ARM64 and 32-bit Windows are not supported by the bundled
+WinDivert driver. Use a Windows version still receiving security updates.
+Administrator rights are required for installation and application launch.
 
-- **Region-locked launchers** — Korean / Japanese / Chinese games (Lost Ark
-  via STOVE, FFXIV, Genshin's gacha clients) that geofence to a specific
-  country's IP, where you only want the game on the VPN and not your
-  Discord call sitting on top of it.
-- **One-off region-tied apps** — banking, streaming, regional
-  e-commerce — where you don't want the latency tax of tunneling every
-  packet on your box.
-- **Anyone fighting the limitations of full-tunnel VPN** — OpenVPN
-  Community pushes a `redirect-gateway` directive that hijacks the
-  default route. This client strips that directive and pins only the apps
-  you choose to the VPN adapter.
+1. Obtain `VpnClientSetup-<version>.exe` from this fork's
+   [Releases](../../releases), when available. The application/installer is
+   currently unsigned; only run a build whose origin you trust.
+2. Install the application into Program Files. If a compatible native OpenVPN
+   installation with a DCO or TAP driver is missing, setup installs the bundled
+   OpenVPN Community 2.7.4-I001 prerequisite. Setup reports MSI failures and
+   requests a reboot when required.
+3. Launch the client, import a trusted profile through VPN settings, and enter
+   credentials if required. Supported external certificates and keys are copied
+   into a private folder with the profile. Stored credentials use Windows DPAPI
+   for the user.
+4. Add executable paths under **Manage**, then connect and start the selected
+   applications. The main window displays VPN state and traffic statistics.
 
-## What it isn't
+OpenVPN 2.7 uses DCO/TAP; Wintun was removed upstream. This client lets OpenVPN
+choose a compatible driver. An old `windows-driver wintun` option is ignored by
+OpenVPN 2.7, rather than providing Wintun support. See the
+[OpenVPN 2.7.4 changes](https://github.com/OpenVPN/openvpn/blob/v2.7.4/Changes.rst).
 
-- Not a VPN provider — you bring your own `.ovpn` profile (paid VPN
-  service, self-hosted on a VPS, a friend's router, whatever).
-- Not a proxy. There's no SOCKS server, no userland injection. Tunneling
-  happens at the network layer via WinDivert + smoltcp.
-- Not cross-platform. Windows 10 1607+ only.
+If the window reports **routing unavailable**, inspect the redirector failure
+and diagnostic path displayed below the connection state. Each launch keeps
+`redirector.log` under `%LOCALAPPDATA%\VpnClient\runtime\<launch-id>\` with one
+rotated `.1` archive (up to 2 MiB each). Logs survive normal client shutdown;
+the session binding and temporary profile containing keys are removed.
+Applications start normally. Experimental split DNS does not require a custom
+application launcher or changes to an application's DNS settings.
 
----
+Close this client's session before upgrading or uninstalling. Setup uses file
+ownership and Windows Restart Manager for in-use application files; it does not
+kill all `openvpn.exe` processes or delete a shared WinDivert service. A locked
+driver may require a restart. OpenVPN is a separate installed prerequisite and
+is not removed when this client is uninstalled.
 
-## Install
+### Experimental split DNS
 
-### From the Release
+The mode has a confirmed system-wide resolver failure on the Windows build above.
+The following describes the experimental controls, not a validated setup for regular use.
 
-1. Download `VpnClientSetup-X.Y.Z.exe` from the
-   [Releases page](../../releases).
-2. Run it. Windows SmartScreen warns about an unverified publisher — click
-   **More info → Run anyway** (the installer is unsigned because
-   code-signing certs cost ~$220/yr and this is a hobby project).
-3. The installer drops everything into `C:\Program Files\VpnClient\` and
-   silently installs OpenVPN Community 2.7.4 if you don't already have it.
+While disconnected, enable **Experimental split DNS** in the main window, then
+connect. The client requires current provider DNS metadata, a ready redirector
+and a confirmed recovery-service lease before showing DNS as active. Enabling
+the option alone is not evidence of DNS isolation. Install under Program Files;
+the recovery helper refuses an untrusted or writable installation directory.
 
-### Requires
+The mode replaces `Dnscache` with a temporary stub so ordinary resolver calls
+can emit packets in the calling process. Its independent recovery service keeps
+a durable journal and restores the original service after disconnect, UI/backend
+exit or a later service restart. Shared or unverified Dnscache hosts are refused;
+the client never terminates another NetworkService host to force activation.
+Recovery after real crashes and reboots remains an acceptance requirement.
 
-- Windows 10 1607 (build 14393) or newer, x64
-- Admin rights at install time *and* at launch time (the redirector needs
-  to load the WinDivert capture driver)
+- Unselected applications retain their DNS destinations and ordinary routes,
+  but also experience the shared DNS Client service/cache change.
+- Selected IPv6 or loopback DNS is currently blocked. Queries with unknown or
+  ambiguous process ownership are blocked too; that can affect unselected
+  applications whose DNS ownership cannot be established.
+- Unattributable TCP/UDP IP fragments are blocked in this mode to prevent DNS
+  bypass through noninitial fragments. This may also interrupt fragmented
+  traffic from unselected applications. IPv6 fragments with unresolved extension
+  headers are also blocked; fragment reassembly is not implemented.
+- Loss of the provider/session lease blocks selected ordinary DNS while this
+  redirector is running. Other traffic retains the normal fail-open behavior.
+- An application's own DoH/DoT resolver is not replaced with the provider's DNS.
+  Shared proxy/resolver processes do not provide the original application's EXE
+  identity. This is not universal DNS isolation or a kill switch.
 
-That's the whole prereq list. The installer bundles OpenVPN.
+The option is off by default. Change it while disconnected. Upgrade/uninstall
+refuses a live DNS lease or incomplete restoration and keeps the recovery files
+in place. For diagnostics, run the installed
+`DnsGuard\VpnClient.DnsGuard.exe inspect` as administrator. Do not manually remove
+that directory while recovery is pending. The saved Windows VPN Platform
+experiment is paused in [research/VpnPlatform](research/VpnPlatform/README.md).
 
----
+### Profile import
 
-## Quick start
+The importer reads quoted paths and inline blocks, expands nested `config`
+files, and copies `ca`, `cert`, `key`, `pkcs12`, `tls-auth`, `tls-crypt`,
+`tls-crypt-v2`, `extra-certs`, `crl-verify` files and `dh` dependencies.
+Relative paths, including paths inside nested configs, are resolved from the
+top-level source profile's directory. Missing files, include cycles, unsupported
+directives and oversized inputs are reported before a profile is saved.
 
-1. **Launch** the app from the Start Menu.
-2. **Import an .ovpn profile** via the gear icon next to the Connect
-   button. Add username + password if your provider requires them. They're
-   stored DPAPI-encrypted, per-user.
-3. **Add apps to tunnel** via the **Manage** button under "Tunneled
-   Apps." Point it at any `.exe`. The picker accepts any file type — some
-   games use custom extensions (e.g. Lost Ark's `LOSTARKWeb64.ark`).
-4. **Hit Connect.** Once the header turns green and shows "VPN
-   connected," every listed app egresses through the tunnel.
+Executable hooks/plugins, management overrides, `cd`/`chroot`, external password
+files and inline username/password blocks are unsupported. For username/password
+authentication use a bare `auth-user-pass` directive and save credentials in the
+UI. Encrypted private-key prompts and MFA/challenges remain unsupported.
+Imports use a separate directory per profile, so equal filenames do not overwrite
+another profile. Imported material is private to the current Windows user;
+temporary runtime profiles containing inline keys are removed at session cleanup.
 
-Live stats in the main window show per-app and per-PID bandwidth + the
-total bytes pushed through.
+## Architecture
 
----
-
-## How it works
-
+```text
+WPF UI (elevated)
+  |-- OpenVPN process ------------ VPN interface configuration
+  |-- private session binding ---- process identity + interface + gateway
+  |-- redirector process --------- WinDivert + smoltcp + bridge sockets
+  |-- config.json ---------------- selected executable paths
+  `-- status named pipe <--------- VPN and application statistics
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│  VpnClient.Ui.exe   (WPF + Wpf.Ui, requireAdministrator)            │
-│   ├─ Status pipe       ────► redirector.exe                          │
-│   ├─ Policy pipe       ────► redirector.exe                          │
-│   └─ Job Object holds: redirector, openvpn  (KILL_ON_JOB_CLOSE)     │
-└──────────────────────────────────────────────────────────────────────┘
-                                  ▲
-                                  │ named pipes (protobuf framed)
-                                  ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│  redirector.exe   (Rust + tokio)                                     │
-│   ├─ WinDivert NETWORK layer   ── captures outbound IPv4 packets    │
-│   ├─ Observer (SOCKET layer)   ── populates PID-from-port table     │
-│   ├─ ProcWatcher (sysinfo)     ── path-based PID admission          │
-│   ├─ smoltcp                   ── user-space TCP termination        │
-│   └─ Bridge sockets (IP_UNICAST_IF) ── re-emit on VPN adapter       │
-└──────────────────────────────────────────────────────────────────────┘
-                                  ▲
-                                  │
-┌──────────────────────────────────────────────────────────────────────┐
-│  openvpn.exe   (Community 2.7.x, --windows-driver wintun)            │
-│   └─ Wintun / TAP-Windows6 adapter                                   │
-└──────────────────────────────────────────────────────────────────────┘
-```
 
-### Why smoltcp instead of just `route ADD ... IF`?
+The UI assigns its OpenVPN/redirector processes to a Windows Job Object before
+they run. Normal shutdown signals the redirector to release its network handles
+and owned route before closing the Job; the Job provides process cleanup when
+the UI exits unexpectedly. Forced termination cannot guarantee route cleanup.
 
-Windows won't accept reinjected packets whose source is a non-loopback
-address and destination is a loopback. That kills the naive "DNAT a
-tunneled flow to 127.0.0.1, run a SOCKS server there, reinject" approach.
-Same reason mitmproxy_rs uses smoltcp on Windows — terminate TCP in
-userspace, open a fresh kernel socket to the original destination, bridge
-the two.
+The production redirector does not expose the experimental policy pipe. The
+status pipe permits the launching Windows user and SYSTEM, and the UI checks that
+the server PID belongs to the redirector process it started. These checks are
+implemented in code; cross-user IPC acceptance tests still require a Windows
+test environment.
 
-### How fast-launching apps get admitted
+The redirector resolves socket ownership and executable paths, tracks process
+identity rather than trusting a reused PID, and periodically reloads selected
+paths from `%APPDATA%\VpnClient\config.json`. Policy revisions revoke flows
+admitted under an old selection rather than retaining stale PID membership.
+TCP streams terminate in smoltcp and bridge to a new Windows socket; UDP uses
+per-flow bridge sockets. `IP_UNICAST_IF` binds those sockets to a VPN interface.
 
-Some apps (game launchers especially) make their first outbound connection
-within microseconds of spawning. A polling process watcher loses that race
-every time. Admission happens in three layers, in order of preference:
+OpenVPN 2.7's authenticated `management-up-down` events provide the interface
+index and gateway. The UI publishes them only after a matching `CONNECTED` event,
+and revokes the binding on reconnect, disconnect or process exit. The redirector
+requires this binding (`observe --session-file <path>`) and revalidates it every
+250 ms. Authenticated management PUSH metadata supplies DNS separately, without
+applying it to the system. `route-noexec` and `route-nopull` enforce the route/DNS policy; a nonexecuted
+route supplies OpenVPN's gateway metadata. See the
+[OpenVPN 2.7 manual](https://openvpn.net/community-docs/community-articles/openvpn-2-7-manual.html).
 
-1. **Observer fast path** — WinDivert SOCKET layer fires on `connect()`
-   with full PID context. Usually beats the SYN.
-2. **Packet-time path match** — when a captured SYN has no known PID
-   yet, we look it up synchronously via `GetExtendedTcpTable`, then
-   match its exe path against the user's tunneled list. Admits the PID
-   on the spot.
-3. **Tight retry** — if both miss, we hold the packet (it's in
-   WinDivert's queue, hasn't hit the wire) and re-poll every 200 µs for
-   up to 1 ms.
-
-If after all of that the kernel still can't tell us who owns the socket,
-the packet passes through to the default route. In practice that doesn't
-happen for any user-mode process.
-
-### Process lifecycle
-
-The UI owns a Win32 Job Object with `KILL_ON_JOB_CLOSE`. Both
-`redirector.exe` and `openvpn.exe` are assigned to it. Closing the UI —
-clean exit or crash — kills both via the kernel, guaranteed. No
-"redirector is still running from yesterday" orphan state.
-
----
+`supervisor/` is an experimental command-line launcher, not part of the WPF
+workflow or installer. Rust `ui/` is a placeholder. Messages declared in the
+protobuf schema do not imply that every command/event is implemented.
 
 ## Build from source
 
-### Requires
+Use native x64 Windows with:
 
-- [Rust](https://rustup.rs/) (stable, 1.75+)
-- [.NET 8 SDK](https://dotnet.microsoft.com/download)
-- [Inno Setup 6](https://jrsoftware.org/isdl.php) (only for `build.ps1`'s
-  installer step; `winget install JRSoftware.InnoSetup` works)
+- Rust **1.98.1 MSVC**, installed with rustup. `rust-toolchain.toml` selects the
+  release toolchain. The supported minimum is Rust 1.98; the largest declared
+  dependency requirement in the current lockfile is smoltcp 0.13.1's Rust 1.91,
+  but older toolchains are not part of this project's supported build baseline.
+- Visual Studio Build Tools with **Desktop development with C++**, MSVC x64/x86
+  tools and a Windows SDK. The GNU Rust toolchain is not supported here.
+- .NET SDK **10.0.400**, selected exactly by `global.json` so servicing SDKs cannot
+  silently change the implicit packages required by the committed lockfile.
+  The application targets .NET 8 and ships its runtime in the self-contained
+  publish output; no separate .NET installation is required on the target PC.
+- Inno Setup **6.7 or newer** for installer packaging.
 
-### One-shot
+From any directory, supply the absolute path to the script:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File installer\build.ps1
+powershell -ExecutionPolicy Bypass -File C:\path\to\OpenVPN-Split-Tunneling\installer\build.ps1
 ```
 
-Builds redirector, publishes the UI as a single self-contained `.exe`,
-downloads the OpenVPN MSI to `installer\deps\` (cached across rebuilds),
-and produces `installer\Output\VpnClientSetup-<version>.exe`.
+The script enters the repository root, puts rustup before any older system Rust
+installation, checks MSVC, builds with `Cargo.lock`, publishes the UI and DNS recovery helper, verifies
+NuGet dependencies against `packages.lock.json`, checks the WinDivert staging
+files, and compiles setup. It **never executes the setup**.
+The output is `installer/Output/VpnClientSetup-1.3.3.exe`.
 
-### Just iterate on the UI
+The bundled OpenVPN download is pinned by SHA-256 and requires a valid OpenVPN
+Authenticode signature. Every cached use is checked; downloads are verified
+before atomically replacing the cache. `-SkipBuild` packages existing build
+outputs but still checks the native files and the prerequisite MSI.
 
+For development, run these commands from the repository root:
+
+```powershell
+$env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+./research/VpnPlatform/build.ps1 # offline checks and unsigned VM package only
+dotnet restore dotnet/VpnClient.Tests/VpnClient.Tests.csproj --locked-mode
+dotnet test dotnet/VpnClient.Tests/VpnClient.Tests.csproj -c Release --nologo --no-restore
+dotnet restore dotnet/VpnClient.DnsGuard.Tests/VpnClient.DnsGuard.Tests.csproj --locked-mode
+dotnet test dotnet/VpnClient.DnsGuard.Tests/VpnClient.DnsGuard.Tests.csproj -c Release --nologo --no-restore
+cargo build --locked --release -p redirector
+dotnet restore dotnet/VpnClient.Ui/VpnClient.Ui.csproj --locked-mode
+dotnet publish dotnet/VpnClient.Ui/VpnClient.Ui.csproj -c Release --no-restore
+dotnet restore dotnet/VpnClient.DnsGuard/VpnClient.DnsGuard.csproj --locked-mode
+dotnet publish dotnet/VpnClient.DnsGuard/VpnClient.DnsGuard.csproj -c Release --no-restore
+./installer/test-native-staging.ps1
+./installer/test-legacy-retirement.ps1
+./installer/test-dependencies.ps1  # requires the verified MSI cache from build.ps1
 ```
-dotnet build dotnet\VpnClient.Ui\VpnClient.Ui.csproj
-```
 
-### Just iterate on the redirector
+Keep `redirector.exe`, `WinDivert.dll` and `WinDivert64.sys` together when running
+a built client. Do not rely on a hard-coded developer checkout path.
 
-```
-cargo build --release --manifest-path redirector\Cargo.toml
-```
+The .NET projects keep NuGet lockfiles in source control. When intentionally
+updating a package reference, run `dotnet restore <project> --force-evaluate`,
+review the lockfile diff and rerun tests. CI and packaging use locked restores
+and fail if the package graph disagrees with the committed lockfile.
 
-For dev runs, `VpnClient.Ui\Redirector.cs` falls back to
-`target\release\redirector.exe` and then `target\debug\redirector.exe` if
-no `redirector.exe` is next to the UI binary, so you can edit and rebuild
-either side independently without reinstalling.
+Windows CI is configured to check formatting, clippy and tests, and produce an
+unsigned installer artifact without installing OpenVPN or starting VPN/driver
+processes. Product/setup version
+`1.3.3` and internal Rust workspace crate version `0.1.0` are separate identifiers.
 
----
+## Source layout and licenses
 
-## Layout
+| Directory | Purpose |
+| --- | --- |
+| `dotnet/VpnClient.Ui/` | WPF UI and VPN process management |
+| `dotnet/VpnClient.DnsGuard/` | Experimental DNS stub, independent recovery service and durable journal |
+| `redirector/` | Rust packet redirector |
+| `research/VpnPlatform/` | Paused Windows VPN Platform per-application DNS experiment |
+| `ipc/` | Protobuf definitions and framing |
+| `installer/` | Build, prerequisite validation, setup, licenses |
+| `vendor/windivert/` | WinDivert 2.2.2 binaries and upstream license |
+| `vendor/windivert-rs/` | Patched Rust wrapper: metadata-only events and safe overlapped cancellation |
+| `supervisor/`, `ui/` | Experimental Rust tools |
 
-```
-dotnet/VpnClient.Ui/     C# WPF UI. Talks to redirector over named pipes.
-redirector/              Rust packet redirector — WinDivert + smoltcp.
-ipc/                     Shared protobuf definitions + framing helpers.
-installer/               Inno Setup script + build pipeline.
-supervisor/              (Reserved; future service-mode redirector wrapper.)
-```
-
----
-
-## Known limitations
-
-- **No code signing.** First-run SmartScreen warning. Some antivirus
-  products flag the WinDivert driver as suspicious on principle.
-- **TCP-table race for kernel-mode sockets.** Sockets opened by a driver
-  (almost no user-mode app does this) skip our PID admission and pass
-  through. Not an issue for normal apps.
-- **No IPv6 tunneling.** The redirector captures IPv4 only. Tunneled apps
-  with both IPv4 and IPv6 connectivity will see their IPv6 traffic egress
-  directly. Disable IPv6 on the VPN profile or accept the leak — your
-  call.
-- **Wintun-vs-TAP fallback.** Wintun is preferred; if it isn't installed
-  (rare, since our bundled MSI installs it), OpenVPN falls back to
-  TAP-Windows6 with a working but slower path.
-- **Anti-cheat-compatible.** WinDivert is a NDIS callout, not a
-  kernel-mode socket hook, so EAC / Vanguard / BattlEye don't flag it.
-  But this hasn't been broadly tested with every game.
-
----
-
-## License
-
-The Rust and C# code in this repository is released under the MIT license
-(see [LICENSE](LICENSE)).
-
-This project redistributes:
-
-- [WinDivert](https://reqrypt.org/windivert.html) — LGPLv3 — kernel
-  driver + DLL bundled in the installer.
-- [OpenVPN Community](https://openvpn.net/community/) — GPLv2 (with
-  OpenSSL exception) — MSI bundled in the installer; installs to its own
-  `C:\Program Files\OpenVPN\` and is independently uninstallable.
-
----
-
-## Acknowledgements
-
-- [mitmproxy_rs](https://github.com/mitmproxy/mitmproxy_rs) for the
-  smoltcp-on-WinDivert architecture that made user-space TCP termination
-  on Windows actually work.
-- [Wpf.Ui](https://github.com/lepoco/wpfui) for the Fluent v2 / Mica
-  treatment — the entire reason this app doesn't look like Windows XP.
-- The OpenVPN community devs for the `--pull-filter` machinery that lets
-  us strip `redirect-gateway` cleanly.
+This project's own Rust, C# and C++ source is [MIT licensed](LICENSE). Third-party
+components retain their own licenses. Setup includes the client license,
+WinDivert's LGPLv3/GPL texts and OpenVPN's GPLv2 text and linking exceptions
+under `licenses/`. See [third-party notices](installer/licenses/THIRD-PARTY-NOTICES.txt)
+for component origins and source links. OpenVPN remains a separate installation.

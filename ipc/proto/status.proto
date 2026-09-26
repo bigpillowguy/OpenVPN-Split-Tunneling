@@ -25,6 +25,24 @@ message Snapshot {
   // Per-app counters land here once the UI starts requesting them — left empty
   // in session A.
   repeated AppStats apps = 3;
+  SplitDnsState split_dns = 4;
+}
+
+// Readiness of packet interception, not proof that the DNS Client service was
+// replaced. The UI also requires its independent guard lease to be active.
+message SplitDnsState {
+  bool enabled = 1;
+  bool ready = 2;
+  // Lowercase 32-hex-digit GUID "N" format, in textual/network byte order.
+  string session_id = 3;
+  string generation = 4;
+  uint64 dropped = 5;
+  string fault = 6; // bounded, controlled diagnostic code; no packet data
+  // Applied private control command. Provider readiness above is independent.
+  bool armed = 7;
+  string control_lease = 8; // lowercase GUID N, empty before first applied command
+  uint64 control_revision = 9;
+  string control_error = 10; // controlled code; invalid input retains applied state
 }
 
 message VpnState {

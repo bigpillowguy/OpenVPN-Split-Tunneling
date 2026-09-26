@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Linq;
 
 namespace VpnClient.Ui;
 
@@ -14,22 +15,19 @@ public static class OvpnParser
     {
         try
         {
-            foreach (var raw in File.ReadAllLines(filePath))
-            {
-                var line = raw.Trim();
-                if (line.StartsWith("#") || line.StartsWith(";")) continue;
-                if (!line.StartsWith("remote ", StringComparison.OrdinalIgnoreCase)) continue;
-                var parts = line.Split(
-                    (char[]?)null,
-                    StringSplitOptions.RemoveEmptyEntries
-                );
-                if (parts.Length >= 2) return parts[1];
-            }
+            return OvpnProfileImporter.LoadExpanded(filePath, validateSupported: false).Nodes
+                .FirstOrDefault(node => node.Kind == OvpnNodeKind.Directive && node.Name == "remote" && node.Tokens.Count >= 2)?.Tokens[1];
         }
-        catch
+        catch (Exception error) when (error is IOException or InvalidDataException or UnauthorizedAccessException or ArgumentException or System.Text.DecoderFallbackException)
         {
             // fall through
         }
         return null;
+    }
+
+    public static bool RequiresUserPassword(string filePath)
+    {
+        // Metadata detection remains separate from the import/runtime safety validation.
+        return OvpnProfileImporter.LoadExpanded(filePath, validateSupported: false).Nodes.Any(node => node.Name == "auth-user-pass");
     }
 }

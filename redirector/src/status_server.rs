@@ -1,24 +1,68 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
-use ipc::status::{status_message::Body, AppStats, PidStats, Snapshot, StatusMessage, Totals, VpnState};
-use ipc::STATUS_PIPE_NAME;
-use tokio::io::AsyncWriteExt;
-use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
-use windows::core::{w, BOOL};
-use windows::Win32::Foundation::{LocalFree, HLOCAL};
-use windows::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+use ipc::status::{
+    status_message::Body, AppStats, PidStats, Snapshot, SplitDnsState, StatusMessage, Totals,
+    VpnState,
 };
-use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+use ipc::STATUS_PIPE_NAME;
+use prost::Message;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+use windows::core::{BOOL, PCWSTR, PWSTR};
+use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
+use windows::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
+use windows::Win32::Security::{
+    GetTokenInformation, TokenUser, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY,
+    TOKEN_USER,
+};
+use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 use crate::vpn_state::{self, VpnState as VpnStateHandle};
 
 const TICK: Duration = Duration::from_millis(500);
+const MAX_CLIENTS: usize = 4;
+const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_FRAME: usize = 1024 * 1024;
+const DNS_READY_TTL: Duration = Duration::from_secs(2);
+
+#[derive(Default)]
+struct DnsStatus {
+    state: SplitDnsState,
+    refreshed: Option<Instant>,
+}
+
+fn guid_hex(bytes: [u8; 16]) -> String {
+    use std::fmt::Write;
+    let mut result = String::with_capacity(32);
+    for byte in bytes {
+        let _ = write!(result, "{byte:02x}");
+    }
+    result
+}
+
+fn dns_snapshot(status: &DnsStatus, now: Instant, session: Option<[u8; 16]>) -> SplitDnsState {
+    let mut state = status.state.clone();
+    let fresh = status
+        .refreshed
+        .is_some_and(|time| now.saturating_duration_since(time) <= DNS_READY_TTL);
+    let same_session = session.is_some_and(|id| state.session_id == guid_hex(id));
+    if !state.enabled || !fresh || !same_session {
+        state.ready = false;
+        state.session_id.clear();
+        state.generation.clear();
+        if state.enabled && !fresh {
+            state.fault = "dataplane_stale".into();
+        }
+    }
+    state
+}
 
 pub struct StatusBus {
     pub bytes_out: Arc<AtomicU64>,
@@ -29,6 +73,7 @@ pub struct StatusBus {
     pub pid_bytes_in: Arc<DashMap<u32, AtomicU64>>,
     /// PID → canonical exe path, populated by proc_watcher.
     pub pid_paths: Arc<DashMap<u32, String>>,
+    split_dns: Mutex<DnsStatus>,
 }
 
 impl StatusBus {
@@ -40,6 +85,7 @@ impl StatusBus {
             pid_bytes_out: Arc::new(DashMap::new()),
             pid_bytes_in: Arc::new(DashMap::new()),
             pid_paths: Arc::new(DashMap::new()),
+            split_dns: Mutex::new(DnsStatus::default()),
         }
     }
 
@@ -56,6 +102,49 @@ impl StatusBus {
             .or_insert_with(|| AtomicU64::new(0))
             .fetch_add(n, Ordering::Relaxed);
     }
+
+    /// Called only by the running capture loop after both packet handles opened.
+    /// A missing provider/session revokes readiness without disabling DNS drops.
+    pub fn set_split_dns(&self, enabled: bool, lease: Option<([u8; 16], [u8; 16])>) {
+        let mut status = self.split_dns.lock().unwrap();
+        status.state.enabled = enabled;
+        let lease = lease.filter(|(session, generation)| {
+            enabled && *session != [0; 16] && *generation != [0; 16]
+        });
+        status.state.ready = lease.is_some();
+        status.state.session_id = lease.map(|value| guid_hex(value.0)).unwrap_or_default();
+        status.state.generation = lease.map(|value| guid_hex(value.1)).unwrap_or_default();
+        status.refreshed = Some(Instant::now());
+    }
+
+    pub fn split_dns_drop(&self, fault: &'static str) {
+        let mut status = self.split_dns.lock().unwrap();
+        status.state.dropped = status.state.dropped.saturating_add(1);
+        // Never allow this status field to become a query/profile logging path.
+        status.state.fault = if !fault.is_empty()
+            && fault.len() <= 64
+            && fault
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        {
+            fault.into()
+        } else {
+            "dns_packet_rejected".into()
+        };
+    }
+
+    /// The capture loop publishes this only after its flow/packet cleanup barrier.
+    pub fn set_split_dns_control(&self, acknowledgement: crate::dns_control::Acknowledgement) {
+        let mut status = self.split_dns.lock().unwrap();
+        status.state.armed = acknowledgement.armed;
+        status.state.control_lease = acknowledgement.lease.map(guid_hex).unwrap_or_default();
+        status.state.control_revision = acknowledgement.revision;
+        status.state.control_error = acknowledgement.error.into();
+    }
+
+    pub fn clear_split_dns_fault(&self) {
+        self.split_dns.lock().unwrap().state.fault.clear();
+    }
 }
 
 struct SecurityDescriptor {
@@ -63,12 +152,17 @@ struct SecurityDescriptor {
 }
 
 impl SecurityDescriptor {
-    fn allow_authenticated_users() -> Result<Self> {
+    fn current_user() -> Result<Self> {
+        let sid = current_user_sid()?;
+        let sddl: Vec<u16> = format!("D:P(A;;GA;;;SY)(A;;GA;;;{sid})")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
         let mut psd = PSECURITY_DESCRIPTOR::default();
         unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                w!("D:(A;;GA;;;AU)"),
-                SDDL_REVISION_1 as u32,
+                PCWSTR(sddl.as_ptr()),
+                SDDL_REVISION_1,
                 &mut psd,
                 None,
             )
@@ -86,6 +180,41 @@ impl SecurityDescriptor {
     }
 }
 
+fn current_user_sid() -> Result<String> {
+    struct Token(HANDLE);
+    impl Drop for Token {
+        fn drop(&mut self) {
+            let _ = unsafe { CloseHandle(self.0) };
+        }
+    }
+    let mut raw = HANDLE::default();
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw) }?;
+    let token = Token(raw);
+    let mut bytes = 0;
+    let _ = unsafe { GetTokenInformation(token.0, TokenUser, None, 0, &mut bytes) };
+    anyhow::ensure!(
+        bytes as usize >= std::mem::size_of::<TOKEN_USER>(),
+        "invalid token user size"
+    );
+    // Win32 requires aligned TOKEN_USER storage (Vec<u8> does not promise it).
+    let mut buffer = vec![0usize; (bytes as usize).div_ceil(std::mem::size_of::<usize>())];
+    unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenUser,
+            Some(buffer.as_mut_ptr().cast()),
+            bytes,
+            &mut bytes,
+        )
+    }?;
+    let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+    let mut sid = PWSTR::null();
+    unsafe { ConvertSidToStringSidW(user.User.Sid, &mut sid) }?;
+    let result = unsafe { sid.to_string() };
+    let _ = unsafe { LocalFree(Some(HLOCAL(sid.0.cast()))) };
+    Ok(result?)
+}
+
 impl Drop for SecurityDescriptor {
     fn drop(&mut self) {
         unsafe {
@@ -100,6 +229,7 @@ unsafe impl Sync for SecurityDescriptor {}
 fn create_pipe(sd: &SecurityDescriptor, first: bool) -> Result<NamedPipeServer> {
     let attrs = sd.attrs();
     let mut opts = ServerOptions::new();
+    opts.reject_remote_clients(true);
     if first {
         opts.first_pipe_instance(true);
     }
@@ -110,18 +240,28 @@ fn create_pipe(sd: &SecurityDescriptor, first: bool) -> Result<NamedPipeServer> 
 }
 
 pub async fn run(bus: Arc<StatusBus>, vpn_state: VpnStateHandle) -> Result<()> {
-    let sd = SecurityDescriptor::allow_authenticated_users()?;
+    let sd = SecurityDescriptor::current_user()?;
     let mut server = create_pipe(&sd, true)?;
     tracing::info!("status pipe server listening on {}", STATUS_PIPE_NAME);
 
+    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CLIENTS));
+    let mut clients = tokio::task::JoinSet::new();
     loop {
-        server.connect().await.context("status pipe accept failed")?;
+        tokio::select! {
+            result = server.connect() => result.context("status pipe accept failed")?,
+            _ = clients.join_next(), if !clients.is_empty() => continue,
+        }
         let connected = server;
         server = create_pipe(&sd, false)?;
+        let Ok(permit) = permits.clone().try_acquire_owned() else {
+            drop(connected);
+            continue;
+        };
 
         let bus = bus.clone();
         let vpn_state = vpn_state.clone();
-        tokio::spawn(async move {
+        clients.spawn(async move {
+            let _permit = permit;
             if let Err(e) = handle_client(connected, bus, vpn_state).await {
                 tracing::warn!("status client disconnected: {}", e);
             }
@@ -142,12 +282,15 @@ async fn handle_client(
         frame_buf.clear();
         let now = Instant::now();
         let elapsed = now.duration_since(prev_sample).as_secs_f64().max(0.001);
-        let (msg, snapshot_pids) =
-            build_snapshot(&bus, &vpn_state, &prev_pids, elapsed);
+        let (msg, snapshot_pids) = build_snapshot(&bus, &vpn_state, &prev_pids, elapsed);
         prev_pids = snapshot_pids;
         prev_sample = now;
+        anyhow::ensure!(
+            msg.encoded_len() <= MAX_FRAME - 4,
+            "status frame exceeds limit"
+        );
         ipc::encode_status_frame(&msg, &mut frame_buf);
-        if let Err(e) = pipe.write_all(&frame_buf).await {
+        if let Err(e) = write_frame(&mut pipe, &frame_buf, WRITE_TIMEOUT).await {
             if matches!(
                 e.kind(),
                 std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::UnexpectedEof
@@ -156,14 +299,23 @@ async fn handle_client(
             }
             return Err(e.into());
         }
-        if let Err(e) = pipe.flush().await {
-            if matches!(e.kind(), std::io::ErrorKind::BrokenPipe) {
-                return Ok(());
-            }
-            return Err(e.into());
-        }
         tokio::time::sleep(TICK).await;
     }
+}
+
+async fn write_frame<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    frame: &[u8],
+    deadline: Duration,
+) -> std::io::Result<()> {
+    tokio::time::timeout(deadline, async {
+        writer.write_all(frame).await?;
+        writer.flush().await
+    })
+    .await
+    .map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::TimedOut, "status client is not reading")
+    })?
 }
 
 fn build_snapshot(
@@ -201,8 +353,16 @@ fn build_snapshot(
     for entry in bus.pid_paths.iter() {
         let pid = *entry.key();
         let path = entry.value().clone();
-        let out = bus.pid_bytes_out.get(&pid).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
-        let in_ = bus.pid_bytes_in.get(&pid).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
+        let out = bus
+            .pid_bytes_out
+            .get(&pid)
+            .map(|c| c.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        let in_ = bus
+            .pid_bytes_in
+            .get(&pid)
+            .map(|c| c.load(Ordering::Relaxed))
+            .unwrap_or(0);
         let prev = prev_pids.get(&pid).copied().unwrap_or((out, in_));
         let bps_out = ((out.saturating_sub(prev.0)) as f64 / elapsed_s).max(0.0) as u64;
         let bps_in = ((in_.saturating_sub(prev.1)) as f64 / elapsed_s).max(0.0) as u64;
@@ -220,7 +380,7 @@ fn build_snapshot(
         .into_iter()
         .map(|(path, mut pids)| {
             // Most-active first inside each app.
-            pids.sort_by(|a, b| (b.bytes_out + b.bytes_in).cmp(&(a.bytes_out + a.bytes_in)));
+            pids.sort_by_key(|p| std::cmp::Reverse(p.bytes_out.saturating_add(p.bytes_in)));
             let active = pids.len() as u32;
             let total_out: u64 = pids.iter().map(|p| p.bytes_out).sum();
             let total_in: u64 = pids.iter().map(|p| p.bytes_in).sum();
@@ -249,7 +409,7 @@ fn build_snapshot(
         .collect();
 
     let msg = StatusMessage {
-        body: Some(Body::Snapshot(Snapshot {
+        body: Some(Body::Snapshot(Box::new(Snapshot {
             vpn: Some(VpnState {
                 up,
                 adapter_ip,
@@ -263,7 +423,12 @@ fn build_snapshot(
                 active_udp_flows: 0,
             }),
             apps,
-        })),
+            split_dns: Some(dns_snapshot(
+                &bus.split_dns.lock().unwrap(),
+                Instant::now(),
+                now.map(|target| target.session_id),
+            )),
+        }))),
     };
     (msg, next_pids)
 }
@@ -273,4 +438,73 @@ fn unix_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn stalled_client_hits_write_deadline() {
+        let (mut writer, _reader) = tokio::io::duplex(1);
+        let error = write_frame(&mut writer, &[0; 16], Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+    #[test]
+    fn status_acl_uses_current_account() {
+        assert!(current_user_sid().unwrap().starts_with("S-1-"));
+        SecurityDescriptor::current_user().unwrap();
+    }
+
+    #[test]
+    fn dns_readiness_requires_fresh_matching_nonzero_identity() {
+        let bus = StatusBus::new();
+        let session = [0x12; 16];
+        let generation = [0xab; 16];
+        bus.set_split_dns(true, Some((session, generation)));
+        let status = bus.split_dns.lock().unwrap();
+        let time = status.refreshed.unwrap();
+        let valid = dns_snapshot(&status, time, Some(session));
+        assert!(valid.ready);
+        assert_eq!(valid.session_id, "12121212121212121212121212121212");
+        assert_eq!(valid.generation, "abababababababababababababababab");
+        for (instant, identity) in [
+            (
+                time + DNS_READY_TTL + Duration::from_nanos(1),
+                Some(session),
+            ),
+            (time, Some([0x34; 16])),
+            (time, None),
+        ] {
+            let revoked = dns_snapshot(&status, instant, identity);
+            assert!(!revoked.ready);
+            assert!(revoked.session_id.is_empty() && revoked.generation.is_empty());
+        }
+        drop(status);
+        bus.set_split_dns(true, Some(([0; 16], generation)));
+        assert!(!bus.split_dns.lock().unwrap().state.ready);
+    }
+
+    #[test]
+    fn dns_revocation_keeps_mode_and_drop_diagnostics() {
+        let bus = StatusBus::new();
+        bus.set_split_dns(true, Some(([1; 16], [2; 16])));
+        bus.split_dns_drop("ambiguous_owner");
+        bus.set_split_dns(true, None);
+        let status = bus.split_dns.lock().unwrap();
+        assert!(status.state.enabled);
+        assert!(!status.state.ready);
+        assert!(status.state.session_id.is_empty());
+        assert_eq!(status.state.dropped, 1);
+        assert_eq!(status.state.fault, "ambiguous_owner");
+        drop(status);
+        bus.clear_split_dns_fault();
+        assert!(bus.split_dns.lock().unwrap().state.fault.is_empty());
+        bus.split_dns_drop("unsafe query/name");
+        assert_eq!(
+            bus.split_dns.lock().unwrap().state.fault,
+            "dns_packet_rejected"
+        );
+    }
 }

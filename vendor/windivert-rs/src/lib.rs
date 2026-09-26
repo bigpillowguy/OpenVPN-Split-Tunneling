@@ -1,0 +1,86 @@
+#![deny(missing_docs)]
+/*!
+Wrapper around [`windivert_sys`] ffi crate.
+
+# Blocking operations
+Since all the recv/send methods are blocking, usually the filtering/sniffing should be done in a separate thread or a graceful shutdown might not be possible.
+The `shutdown()` method can be used anytime to stop gracefully any ongoing operations, but will prevent any further recv/send calls using the same handle.
+For cases where a handle might need to be reused, `_wait` variants of the methods are provided.
+These variants wait for data for the specified duration, then cancel an outstanding read.
+Cancellation is drained before returning so the kernel cannot access released buffers;
+this final drain can extend the call beyond the requested timeout.
+
+# Example
+```no_run
+use windivert::prelude::*;
+
+let Ok(divert) = WinDivert::network("ip and tcp.DstPort == 443", 0, Default::default()) else {
+    panic!("Failed to create WinDivert");
+};
+
+let shutdown_handle = divert.shutdown_handle();
+
+let handle = std::thread::spawn(move || {
+    // Do something in the background
+    let mut buffer = [0u8; 1500];
+
+    loop {
+        match divert.recv(&mut buffer) {
+            Ok(packet) => {
+                // In capture mode the packet is captured and not calling `send()` with it will prevent it from reaching the destination.
+                divert.send(&packet).expect("Failed to send packet");
+            }
+            Err(WinDivertError::Recv(WinDivertRecvError::NoData)) => {
+                // Handle was shutdown, and there is no more pending data to receive
+                break;
+            }
+            Err(e) => {
+                // Other errors
+                eprintln!("Error receiving packet: {}", e);
+            }
+        }
+    }
+    // The handle is implicitly closed once `divert` is dropped
+});
+
+std::thread::sleep(std::time::Duration::from_secs(10));
+
+shutdown_handle
+    .shutdown()
+    .expect("Failed to shutdown WinDivert");
+
+handle.join().unwrap();
+```
+*/
+
+/// Module containing abstractions of core low level apis to enable mocking the blocking operations and test the remaining code
+pub(crate) mod core;
+
+/// WinDivert address data structures
+pub mod address;
+mod divert;
+/// WinDivert error types
+pub mod error;
+/// Layer types used for typestate pattern
+pub mod layer;
+/// WinDivert packet types
+pub mod packet;
+
+pub use divert::*;
+
+mod utils;
+
+/// Prelude module for [`WinDivert`].
+pub mod prelude {
+    pub use windivert_sys::{
+        WinDivertEvent, WinDivertFlags, WinDivertLayer, WinDivertParam, WinDivertShutdownMode,
+    };
+
+    pub use crate::address::*;
+    pub use crate::divert::*;
+    pub use crate::error::*;
+    pub use crate::layer::*;
+    pub use crate::packet::*;
+}
+
+pub(crate) mod test_data;

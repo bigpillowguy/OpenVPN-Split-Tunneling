@@ -2,6 +2,8 @@ using System;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
 
 namespace VpnClient.Ui;
 
@@ -13,25 +15,71 @@ namespace VpnClient.Ui;
 /// </summary>
 public static class JobManager
 {
-    private static readonly Lazy<IntPtr> _job = new(CreateJob);
+    private static readonly Lazy<SafeFileHandle> _job = new(CreateJob);
 
-    public static void Assign(Process process)
+    public static void Initialize() => _ = _job.Value;
+
+    /// <summary>Assign atomically during creation, then resume only after obtaining an owned handle.</summary>
+    public static Process Start(ProcessStartInfo startInfo)
     {
-        if (process.HasExited) return;
-        if (!AssignProcessToJobObject(_job.Value, process.Handle))
+        Initialize();
+        if (startInfo.UseShellExecute || startInfo.Arguments.Length != 0)
+            throw new ArgumentException("Owned children require an explicit executable and ArgumentList.");
+        var command = new StringBuilder(WindowsCommandLine.Quote(startInfo.FileName));
+        foreach (var argument in startInfo.ArgumentList)
+            command.Append(' ').Append(WindowsCommandLine.Quote(argument));
+        nuint bytes = 0;
+        InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref bytes);
+        var attributes = Marshal.AllocHGlobal(checked((int)bytes));
+        var jobValue = Marshal.AllocHGlobal(IntPtr.Size);
+        var initialized = false;
+        try
         {
-            // Already in a job that can't be broken out of? Surface so the
-            // caller knows the "kill-on-close" guarantee isn't in effect.
-            // We don't throw — the process still runs, just unguarded.
-            var err = Marshal.GetLastWin32Error();
-            Debug.WriteLine($"AssignProcessToJobObject failed: {err}");
+            if (!InitializeProcThreadAttributeList(attributes, 1, 0, ref bytes))
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "InitializeProcThreadAttributeList");
+            initialized = true;
+            Marshal.WriteIntPtr(jobValue, _job.Value.DangerousGetHandle());
+            // PROC_THREAD_ATTRIBUTE_JOB_LIST: the kernel assigns before the child can execute.
+            if (!UpdateProcThreadAttribute(attributes, 0, (nuint)0x0002000D, jobValue, (nuint)IntPtr.Size, IntPtr.Zero, IntPtr.Zero))
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "UpdateProcThreadAttribute(JOB_LIST)");
+            var startup = new STARTUPINFOEX { StartupInfo = new STARTUPINFO { cb = Marshal.SizeOf<STARTUPINFOEX>() }, AttributeList = attributes };
+            const uint flags = 0x00080000 | 0x08000000 | 0x00000004; // EXTENDED_STARTUPINFO | NO_WINDOW | SUSPENDED
+            if (!CreateProcess(startInfo.FileName, command, IntPtr.Zero, IntPtr.Zero, false, flags,
+                    IntPtr.Zero, startInfo.WorkingDirectory, ref startup, out var info))
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "CreateProcess (owned Job)");
+            using var processHandle = new SafeFileHandle(info.Process, ownsHandle: true);
+            using var threadHandle = new SafeFileHandle(info.Thread, ownsHandle: true);
+            Process? process = null;
+            try
+            {
+                process = Process.GetProcessById((int)info.ProcessId);
+                _ = process.Handle; // Keep identity pinned while the primary thread is suspended.
+                if (ResumeThread(threadHandle) == uint.MaxValue)
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "ResumeThread");
+                return process;
+            }
+            catch
+            {
+                TerminateProcess(processHandle, 1);
+                WaitForSingleObject(processHandle, 5000);
+                process?.Dispose();
+                throw;
+            }
+        }
+        finally
+        {
+            if (initialized) DeleteProcThreadAttributeList(attributes);
+            Marshal.FreeHGlobal(attributes);
+            Marshal.FreeHGlobal(jobValue);
         }
     }
 
-    private static IntPtr CreateJob()
+    public static void Close() { if (_job.IsValueCreated) _job.Value.Dispose(); }
+
+    private static SafeFileHandle CreateJob()
     {
-        var handle = CreateJobObject(IntPtr.Zero, null);
-        if (handle == IntPtr.Zero)
+        var handle = new SafeFileHandle(CreateJobObject(IntPtr.Zero, null), ownsHandle: true);
+        if (handle.IsInvalid)
             throw new Win32Exception(Marshal.GetLastWin32Error(), "CreateJobObject");
 
         var info = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION
@@ -49,6 +97,7 @@ public static class JobManager
             if (!SetInformationJobObject(handle, JobObjectExtendedLimitInformation, buf, (uint)len))
                 throw new Win32Exception(Marshal.GetLastWin32Error(), "SetInformationJobObject");
         }
+        catch { handle.Dispose(); throw; }
         finally
         {
             Marshal.FreeHGlobal(buf);
@@ -101,9 +150,38 @@ public static class JobManager
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool SetInformationJobObject(
-        IntPtr hJob, int JobObjectInfoClass, IntPtr lpJobObjectInfo, uint cbJobObjectInfoLength);
+        SafeFileHandle hJob, int JobObjectInfoClass, IntPtr lpJobObjectInfo, uint cbJobObjectInfoLength);
 
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct STARTUPINFO
+    {
+        public int cb;
+        public string? Reserved, Desktop, Title;
+        public uint X, Y, XSize, YSize, XCountChars, YCountChars, FillAttribute, Flags;
+        public ushort ShowWindow, Reserved2;
+        public IntPtr Reserved2Ptr, StdInput, StdOutput, StdError;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct STARTUPINFOEX { public STARTUPINFO StartupInfo; public IntPtr AttributeList; }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PROCESS_INFORMATION { public IntPtr Process, Thread; public uint ProcessId, ThreadId; }
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool AssignProcessToJobObject(IntPtr hJob, IntPtr hProcess);
+    private static extern bool InitializeProcThreadAttributeList(IntPtr list, int count, uint flags, ref nuint size);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool UpdateProcThreadAttribute(IntPtr list, uint flags, nuint attribute, IntPtr value, nuint size, IntPtr previous, IntPtr returnedSize);
+    [DllImport("kernel32.dll")]
+    private static extern void DeleteProcThreadAttributeList(IntPtr list);
+    [DllImport("kernel32.dll", EntryPoint = "CreateProcessW", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CreateProcess(string application, StringBuilder commandLine, IntPtr processAttributes, IntPtr threadAttributes,
+        [MarshalAs(UnmanagedType.Bool)] bool inheritHandles, uint flags, IntPtr environment, string? directory, ref STARTUPINFOEX startup, out PROCESS_INFORMATION process);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint ResumeThread(SafeFileHandle thread);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool TerminateProcess(SafeFileHandle process, uint exitCode);
+    [DllImport("kernel32.dll")]
+    private static extern uint WaitForSingleObject(SafeFileHandle process, uint milliseconds);
 }

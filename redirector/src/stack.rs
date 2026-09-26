@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 
-use smoltcp::phy::{Checksum, ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::phy::{
+    Checksum, ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken,
+};
 use smoltcp::time::Instant;
 
 pub struct VirtualDevice {
@@ -22,6 +24,15 @@ impl VirtualDevice {
 
     pub fn pop_tx(&mut self) -> Option<Vec<u8>> {
         self.tx.pop_front()
+    }
+
+    pub fn retain_packets(
+        &mut self,
+        mut keep_rx: impl FnMut(&[u8]) -> bool,
+        mut keep_tx: impl FnMut(&[u8]) -> bool,
+    ) {
+        self.rx.retain(|packet| keep_rx(packet));
+        self.tx.retain(|packet| keep_tx(packet));
     }
 }
 
@@ -45,7 +56,9 @@ impl Device for VirtualDevice {
         let pkt = self.rx.pop_front()?;
         Some((
             VirtRxToken { data: pkt },
-            VirtTxToken { queue: &mut self.tx },
+            VirtTxToken {
+                queue: &mut self.tx,
+            },
         ))
     }
 

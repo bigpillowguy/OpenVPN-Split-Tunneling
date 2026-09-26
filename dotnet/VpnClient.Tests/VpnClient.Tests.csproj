@@ -1,0 +1,46 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+  <!-- Run the actual non-visual production sources on the installed test runtime.
+       The WPF application remains net8.0; these tests never start it or a driver. -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" PrivateAssets="all" />
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="10.0.0" />
+    <PackageReference Include="Google.Protobuf" Version="3.28.3" />
+    <PackageReference Include="Grpc.Tools" Version="2.66.0" PrivateAssets="all" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="../VpnClient.Ui/Config.cs" Link="Production/Config.cs" />
+    <Compile Include="../VpnClient.Ui/Crypto.cs" Link="Production/Crypto.cs" />
+    <Compile Include="../VpnClient.Ui/OvpnParser.cs" Link="Production/OvpnParser.cs" />
+    <Compile Include="../VpnClient.Ui/OvpnDocument.cs" Link="Production/OvpnDocument.cs" />
+    <Compile Include="../VpnClient.Ui/OvpnProfileImporter.cs" Link="Production/OvpnProfileImporter.cs" />
+    <Compile Include="../VpnClient.Ui/OvpnRuntimeProfile.cs" Link="Production/OvpnRuntimeProfile.cs" />
+    <Compile Include="../VpnClient.Ui/OpenVpnTunnelMetadata.cs" Link="Production/OpenVpnTunnelMetadata.cs" />
+    <Compile Include="../VpnClient.Ui/OpenVpnDnsMetadata.cs" Link="Production/OpenVpnDnsMetadata.cs" />
+    <Compile Include="../VpnClient.Ui/VpnSessionBindingStore.cs" Link="Production/VpnSessionBindingStore.cs" />
+    <Compile Include="../VpnClient.Ui/WindowsVpnAdapter.cs" Link="Production/WindowsVpnAdapter.cs" />
+    <Compile Include="../VpnClient.Ui/VpnSessionController.cs" Link="Production/VpnSessionController.cs" />
+    <Compile Include="../VpnClient.Ui/ManagementProtocol.cs" Link="Production/ManagementProtocol.cs" />
+    <Compile Include="../VpnClient.Ui/SessionSecrets.cs" Link="Production/SessionSecrets.cs" />
+    <Compile Include="../VpnClient.Ui/SnapshotValidator.cs" Link="Production/SnapshotValidator.cs" />
+    <Compile Include="../VpnClient.Ui/WindowsCommandLine.cs" Link="Production/WindowsCommandLine.cs" />
+    <Compile Include="../VpnClient.Ui/LoopbackPeer.cs" Link="Production/LoopbackPeer.cs" />
+    <Compile Include="../VpnClient.Ui/Redirector.cs" Link="Production/Redirector.cs" />
+    <Compile Include="../VpnClient.Ui/ExperimentalDnsController.cs" Link="Production/ExperimentalDnsController.cs" />
+    <Compile Include="../VpnClient.Ui/ExperimentalDnsReadiness.cs" Link="Production/ExperimentalDnsReadiness.cs" />
+    <Compile Include="../VpnClient.Ui/DnsGuardClient.cs" Link="Production/DnsGuardClient.cs" />
+    <Compile Include="../VpnClient.Ui/DnsControlFile.cs" Link="Production/DnsControlFile.cs" />
+    <Compile Include="../VpnClient.Ui/JobManager.cs" Link="Production/JobManager.cs" />
+    <Protobuf Include="../../ipc/proto/status.proto" GrpcServices="None" ProtoRoot="../../ipc/proto" />
+    <None Include="../../tests/fixtures/dns-control-arm-v1.json" Link="Fixtures/dns-control-arm-v1.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>
