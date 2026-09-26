@@ -1,0 +1,29 @@
+OpenVPN Split Tunneling Client
+
+The project's Rust and C# source is MIT licensed; see the installed LICENSE.
+This does not change the licenses of the components below.
+
+WinDivert 2.2.2
+Upstream author: Basil (basil00).
+The supplied DLL and driver use the LGPLv3 licensing option. Full upstream
+license texts are in WinDivert-LICENSE.txt. These files are unmodified.
+Source and build instructions: https://github.com/basil00/WinDivert/tree/v2.2.2
+Upstream project: https://reqrypt.org/windivert.html
+
+OpenVPN Community 2.7.4-I001 amd64
+Copyright (C) 2002-2026 OpenVPN Inc.
+The official MSI is bundled unchanged and installed separately as a prerequisite.
+OpenVPN uses GPLv2 with upstream linking exceptions. See OpenVPN-COPYING.txt
+and OpenVPN-GPL-2.0.txt. Additional MSI components retain their own upstream
+licenses; their documentation is distributed by the OpenVPN project.
+Core source: https://github.com/OpenVPN/openvpn/tree/v2.7.4
+Windows packaging and component sources: https://github.com/OpenVPN/openvpn-build
+Package: https://swupdate.openvpn.org/community/releases/OpenVPN-2.7.4-I001-amd64.msi
+
+The application also uses Rust crates and .NET libraries. Their versions and
+license declarations can be inspected with cargo metadata --locked and the
+NuGet package metadata referenced by dotnet/VpnClient.Ui/VpnClient.Ui.csproj.
+Principal components include smoltcp, Tokio, Prost, windows-rs, sysinfo,
+WinDivert Rust bindings, WPF-UI, Google.Protobuf, and the Microsoft .NET runtime.
+Source for this client, Cargo.lock and build scripts:
+https://github.com/bigpillowguy/OpenVPN-Split-Tunneling
