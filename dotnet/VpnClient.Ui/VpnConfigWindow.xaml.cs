@@ -5,6 +5,7 @@ using System.Linq;
 using System.Windows;
 using Microsoft.Win32;
 using Wpf.Ui.Controls;
+using MessageBoxButton = System.Windows.MessageBoxButton;
 
 namespace VpnClient.Ui;
 
@@ -24,7 +25,13 @@ public partial class VpnConfigWindow : FluentWindow
         ProfileList.ItemsSource = Profiles;
         if (Profiles.Count > 0)
             ProfileList.SelectedIndex = 0;
+        App.Connector.StateChanged += OnConnectorStateChanged;
+        Closed += (_, _) => App.Connector.StateChanged -= OnConnectorStateChanged;
+        RefreshConnectButton();
     }
+
+    private void OnConnectorStateChanged(object? sender, EventArgs e) => Dispatcher.BeginInvoke(RefreshConnectButton);
+    private void RefreshConnectButton() => ConnectProfileBtn.IsEnabled = App.Connector.State is not (VpnConnectionState.Connecting or VpnConnectionState.Disconnecting);
 
     private void ImportBtn_Click(object sender, RoutedEventArgs e)
     {
@@ -98,8 +105,8 @@ public partial class VpnConfigWindow : FluentWindow
             current.DisplayName = Path.GetFileNameWithoutExtension(current.FilePath);
         current.ServerOverride = ServerOverrideBox.Text.Trim();
         current.Username = UsernameBox.Text.Trim();
-        current.SetPassword(PasswordBox.Password);
-        Persist();
+        try { current.SetPassword(PasswordBox.Password); Persist(); }
+        catch (Exception ex) { ShowSaveError(ex); }
 
         // OvpnEntry isn't observable; force the ListView to re-render in place.
         ProfileList.Items.Refresh();
@@ -126,24 +133,10 @@ public partial class VpnConfigWindow : FluentWindow
     private async void ConnectProfileBtn_Click(object sender, RoutedEventArgs e)
     {
         if (_editing is null) return;
-        if (string.IsNullOrWhiteSpace(_editing.Username)
-            || string.IsNullOrWhiteSpace(_editing.GetPassword()))
-        {
-            var result = System.Windows.MessageBox.Show(
-                "This profile has no username or password saved yet.\n" +
-                "OpenVPN will prompt interactively, which won't work from a hidden window.\n\n" +
-                "Save credentials in this profile first and try again.",
-                "Missing credentials",
-                System.Windows.MessageBoxButton.OK,
-                System.Windows.MessageBoxImage.Warning);
-            return;
-        }
-
-        _cfg.ActiveOvpnId = _editing.Id;
-        _cfg.Save();
-
         try
         {
+            _cfg.ActiveOvpnId = _editing.Id;
+            _cfg.Save();
             await App.Connector.ConnectAsync(_editing);
         }
         catch (Exception ex)
@@ -160,8 +153,14 @@ public partial class VpnConfigWindow : FluentWindow
 
     private void Persist()
     {
-        _cfg.OvpnFiles = Profiles.ToList();
-        _cfg.Save();
-        ConfigChanged?.Invoke(this, EventArgs.Empty);
+        try
+        {
+            _cfg.OvpnFiles = Profiles.ToList();
+            _cfg.Save();
+            ConfigChanged?.Invoke(this, EventArgs.Empty);
+        }
+        catch (Exception ex) { ShowSaveError(ex); }
     }
+
+    private static void ShowSaveError(Exception ex) => System.Windows.MessageBox.Show($"Profile changes were not saved:\n{ex.Message}", "Save error", MessageBoxButton.OK, MessageBoxImage.Error);
 }

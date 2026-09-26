@@ -4,6 +4,7 @@ using System.Linq;
 using System.Windows;
 using Microsoft.Win32;
 using Wpf.Ui.Controls;
+using MessageBoxButton = System.Windows.MessageBoxButton;
 
 namespace VpnClient.Ui;
 
@@ -37,8 +38,13 @@ public partial class SettingsWindow : FluentWindow
         var entry = new AppEntry
         {
             DisplayName = System.IO.Path.GetFileNameWithoutExtension(dlg.FileName),
-            ExePath = dlg.FileName,
+            ExePath = Config.NormalizeAppPath(dlg.FileName),
         };
+        if (Apps.Any(app => string.Equals(Config.NormalizeAppPath(app.ExePath), entry.ExePath, StringComparison.OrdinalIgnoreCase)))
+        {
+            AppList.SelectedItem = Apps.First(app => string.Equals(app.ExePath, entry.ExePath, StringComparison.OrdinalIgnoreCase));
+            return;
+        }
         Apps.Add(entry);
         Persist();
     }
@@ -56,8 +62,15 @@ public partial class SettingsWindow : FluentWindow
 
     private void Persist()
     {
-        _cfg.TunneledApps = Apps.ToList();
-        _cfg.Save();
-        ConfigChanged?.Invoke(this, EventArgs.Empty);
+        try
+        {
+            _cfg.TunneledApps = Apps.ToList();
+            _cfg.Save();
+            ConfigChanged?.Invoke(this, EventArgs.Empty);
+        }
+        catch (Exception ex)
+        {
+            System.Windows.MessageBox.Show($"Settings were not saved:\n{ex.Message}", "Save error", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
     }
 }

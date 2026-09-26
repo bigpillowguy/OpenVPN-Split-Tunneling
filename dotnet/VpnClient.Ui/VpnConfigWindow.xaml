@@ -109,11 +109,11 @@
                     </StackPanel>
 
                     <StackPanel Grid.Row="3" Margin="0,0,0,16">
-                        <ui:TextBlock Text="Server override"
+                        <ui:TextBlock Text="Server override (not supported yet)"
                                       Foreground="{DynamicResource TextFillColorSecondaryBrush}"
                                       Margin="0,0,0,4" />
                         <ui:TextBox x:Name="ServerOverrideBox"
-                                    PlaceholderText="host or host:port — leave empty to use the .ovpn value" />
+                                    PlaceholderText="Leave empty to use the server in the imported profile" />
                     </StackPanel>
 
                     <StackPanel Grid.Row="4" Margin="0,0,0,16">

@@ -18,12 +18,12 @@ public static class OvpnParser
             {
                 var line = raw.Trim();
                 if (line.StartsWith("#") || line.StartsWith(";")) continue;
-                if (!line.StartsWith("remote ", StringComparison.OrdinalIgnoreCase)) continue;
                 var parts = line.Split(
                     (char[]?)null,
                     StringSplitOptions.RemoveEmptyEntries
                 );
-                if (parts.Length >= 2) return parts[1];
+                if (parts.Length >= 2 && parts[0].Equals("remote", StringComparison.OrdinalIgnoreCase))
+                    return parts[1].Trim('"', '\'');
             }
         }
         catch
@@ -31,5 +31,19 @@ public static class OvpnParser
             // fall through
         }
         return null;
+    }
+
+    public static bool RequiresUserPassword(string filePath)
+    {
+        foreach (var raw in File.ReadLines(filePath))
+        {
+            var line = raw.Trim();
+            if (line.StartsWith('#') || line.StartsWith(';')) continue;
+            var directive = line.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+            if (directive.Length == 0) continue;
+            if (directive[0].Equals("auth-user-pass", StringComparison.OrdinalIgnoreCase) ||
+                directive[0].Equals("<auth-user-pass>", StringComparison.OrdinalIgnoreCase)) return true;
+        }
+        return false;
     }
 }

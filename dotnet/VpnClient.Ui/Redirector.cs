@@ -1,86 +1,65 @@
 using System;
 using System.Diagnostics;
 using System.IO;
-using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace VpnClient.Ui;
 
-/// <summary>
-/// Best-effort launcher for the Rust redirector. The UI runs elevated, so
-/// the spawned redirector inherits admin rights (which it needs to load
-/// the WinDivert driver and create the SYSTEM-friendly named pipes).
-/// </summary>
 public static class Redirector
 {
-    public static bool IsRunning()
+    private static Process? _process;
+    private static EventWaitHandle? _shutdown;
+
+    public static bool IsOwnedServer(uint pid) => _process is { HasExited: false } process && (uint)process.Id == pid;
+
+    public static void Start()
     {
-        try { return Process.GetProcessesByName("redirector").Any(); }
-        catch { return false; }
+        var path = FindBinary(AppContext.BaseDirectory)
+            ?? throw new FileNotFoundException("redirector.exe was not found beside the UI or in the repository target/release or target/debug directory. Build the redirector first.");
+        var start = new ProcessStartInfo(path)
+        {
+            UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = Path.GetDirectoryName(path),
+        };
+        start.ArgumentList.Add("observe");
+        var eventName = @"Local\VpnClient-" + Guid.NewGuid().ToString("N");
+        _shutdown = new EventWaitHandle(false, EventResetMode.ManualReset, eventName);
+        start.ArgumentList.Add("--shutdown-event");
+        start.ArgumentList.Add(eventName);
+        _process = JobManager.Start(start);
     }
 
-    /// <summary>
-    /// Kill stray redirector/openvpn processes left over from a previous
-    /// UI session that exited before the Job Object teardown could fire.
-    /// </summary>
-    public static void KillOrphans()
+    public static string? FindBinary(string baseDirectory)
     {
-        foreach (var name in new[] { "redirector", "openvpn" })
+        var adjacent = Path.Combine(baseDirectory, "redirector.exe");
+        if (File.Exists(adjacent)) return adjacent;
+        // Only recognize an actual checkout ancestor, not an arbitrary target directory.
+        for (var parent = new DirectoryInfo(baseDirectory); parent is not null; parent = parent.Parent)
         {
-            foreach (var p in Process.GetProcessesByName(name))
+            if (!File.Exists(Path.Combine(parent.FullName, "Cargo.toml")) ||
+                !File.Exists(Path.Combine(parent.FullName, "redirector", "Cargo.toml"))) continue;
+            foreach (var configuration in new[] { "release", "debug" })
             {
-                try { p.Kill(entireProcessTree: true); p.WaitForExit(2000); }
-                catch { }
-                finally { p.Dispose(); }
+                var candidate = Path.Combine(parent.FullName, "target", configuration, "redirector.exe");
+                if (File.Exists(candidate)) return candidate;
             }
-        }
-    }
-
-    public static bool TryStart()
-    {
-        var path = FindBinary();
-        if (path is null) return false;
-        try
-        {
-            var psi = new ProcessStartInfo
-            {
-                FileName = path,
-                Arguments = "observe",
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                WindowStyle = ProcessWindowStyle.Hidden,
-                WorkingDirectory = Path.GetDirectoryName(path),
-            };
-            var proc = Process.Start(psi);
-            if (proc is not null)
-            {
-                JobManager.Assign(proc);
-            }
-            return true;
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    private static string? FindBinary()
-    {
-        // 1. Same directory as the UI exe (production / packaged install)
-        var here = Path.GetDirectoryName(Environment.ProcessPath);
-        if (here is not null)
-        {
-            var candidate = Path.Combine(here, "redirector.exe");
-            if (File.Exists(candidate)) return candidate;
-        }
-        // 2. Workspace builds, release first (that's what we ship out of CI)
-        foreach (var dev in new[]
-        {
-            @"C:\Projects\vpn\target\release\redirector.exe",
-            @"C:\Projects\vpn\target\debug\redirector.exe",
-        })
-        {
-            if (File.Exists(dev)) return dev;
         }
         return null;
+    }
+
+    public static async Task StopAsync()
+    {
+        _shutdown?.Set();
+        if (_process is { HasExited: false } process)
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            await process.WaitForExitAsync(timeout.Token);
+        }
+    }
+
+    public static void Dispose()
+    {
+        _shutdown?.Dispose(); _shutdown = null;
+        _process?.Dispose(); _process = null;
     }
 }
