@@ -1,6 +1,11 @@
 [CmdletBinding()]
-param([string]$OutputDirectory = (Join-Path $PSScriptRoot 'out'))
+param([string]$OutputDirectory)
 $ErrorActionPreference = 'Stop'
+# Windows PowerShell 5.1 can evaluate parameter defaults before PSScriptRoot
+# is populated when invoked through -File with a relative script path.
+if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
+    $OutputDirectory = Join-Path $PSScriptRoot 'out'
+}
 $sdk = 'C:\Program Files (x86)\Windows Kits\10'
 $version = '10.0.26100.0'
 $vswhere = 'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe'

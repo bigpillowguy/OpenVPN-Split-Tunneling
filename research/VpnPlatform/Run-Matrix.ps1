@@ -4,10 +4,12 @@ param(
     [Parameter(Mandatory)][ValidateSet('NoVpn', 'All', 'Selected')][string]$Stage,
     [Parameter(Mandatory)][ValidateSet('None', 'Runtime', 'Profile')][string]$AssignmentSource,
     [ValidateSet('.vpn-probe.test', '.')][string]$Namespace = '.vpn-probe.test',
-    [string]$BinaryDirectory = (Join-Path $PSScriptRoot 'out'),
-    [string]$ResultPath = (Join-Path $PSScriptRoot ('result-' + $Stage + '.json'))
+    [string]$BinaryDirectory,
+    [string]$ResultPath
 )
 $ErrorActionPreference = 'Stop'
+if ([string]::IsNullOrWhiteSpace($BinaryDirectory)) { $BinaryDirectory = Join-Path $PSScriptRoot 'out' }
+if ([string]::IsNullOrWhiteSpace($ResultPath)) { $ResultPath = Join-Path $PSScriptRoot ('result-' + $Stage + '.json') }
 if (-not $InsideDisposableVm) { throw 'This matrix sends DNS queries. Run it only inside the prepared disposable VM.' }
 if (($Stage -eq 'NoVpn') -ne ($AssignmentSource -eq 'None')) { throw 'Use source None only for NoVpn; otherwise explicitly identify Runtime or Profile.' }
 if ((Get-Service Dnscache).Status -ne 'Running') { throw 'Dnscache must remain running.' }

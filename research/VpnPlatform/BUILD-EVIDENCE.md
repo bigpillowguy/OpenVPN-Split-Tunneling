@@ -1,6 +1,6 @@
 # Offline build evidence
 
-Recorded 2026-09-26 at 17:06 UTC. **VPN platform runtime status: NOT RUN.**
+Recorded 2026-09-26 at 17:15 UTC. **VPN platform runtime status: NOT RUN.**
 
 Environment:
 
@@ -8,12 +8,13 @@ Environment:
 - MSVC toolset 14.51.36231, x64 compiler/linker.
 - Windows SDK headers/libraries 10.0.26100.0.
 - MakeAppx file/tool version 10.0.26100.8249.
+- Windows PowerShell 5.1.26100.9444, invoked by the same relative `-File` command as CI.
 - Manifest minimum: Windows 11 build 22000, x64.
 
 Command from the repository root:
 
 ```powershell
-./research/VpnPlatform/build.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File research/VpnPlatform/build.ps1
 ```
 
 Observed successful output from the final build:
@@ -39,13 +40,21 @@ Generated local artifacts, excluded from Git by `out/`:
 
 | Artifact | Evidence |
 | --- | --- |
-| `out/VpnPlatformResearch-unsigned.appx` | 326503 bytes; Authenticode status `NotSigned` |
-| Package SHA-256 | `3B8FBEA27C7638E4CF846B475E05FFCC76ABF178B56EF315CC10BB9841A78BCA` |
-| `out/build-output.txt` SHA-256 | `17C2CCB3D781B3BCA33AB8E94A2CA99B6337DB015FA02F932ED33CA4F1A17ABF` |
+| `out/VpnPlatformResearch-unsigned.appx` | 326505 bytes; Authenticode status `NotSigned` |
+| Package SHA-256 | `CFE006B7FEAECCBDC00D3AC6EED08F3D49F5B3D9F26F1F3E1591AF129800B737` |
+| `out/build-result.json` SHA-256 | `97BC23E49A2FC77482433A0C5581CE0CDA72D6FE44F7CBB77BB24A94095184FF` |
 
 The package checksum identifies this particular build, not a reproducible-build
 guarantee; a rebuild can change timestamps/checksum. `git check-ignore` confirmed
 that the unsigned package is excluded.
+
+The original CI invocation failed while evaluating `PSScriptRoot` in a parameter
+default, before compilation or WinRT tests. Both build and matrix scripts now
+resolve their default paths in the script body. The exact Windows PowerShell
+5.1 CI build command above subsequently passed locally without skipping any
+check. The matrix script was parsed only; it was not executed on the host.
+`build-result.json` records the observed invocation, counts and exit code; it is
+a summary, not a raw console transcript. Hosted CI is an independent run.
 
 The new profile checks construct real `VpnPlugInProfile`, `VpnTrafficFilter` and
 `VpnDomainNameInfo` objects in memory for eight runtime/profile, all/selected and
