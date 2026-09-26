@@ -1,6 +1,7 @@
 mod adapter;
 mod diagnostics;
 mod divert;
+mod dns_broker;
 mod flows;
 mod observer;
 mod pidlookup;
@@ -57,14 +58,20 @@ fn dispatch(args: &[String]) -> Result<()> {
 struct ObserveOptions<'a> {
     shutdown_event: Option<&'a str>,
     session_file: &'a std::path::Path,
+    dns_pipe: Option<&'a str>,
 }
 
 fn observe_options(args: &[String]) -> Result<ObserveOptions<'_>> {
     let mut shutdown_event = None;
     let mut session_file = None;
     let mut seen_log_file = false;
+    let mut dns_pipe = None;
     for pair in args.chunks(2) {
         match pair {
+            [flag, value] if flag == "--dns-pipe" && dns_pipe.is_none() => {
+                dns_broker::pipe_path(value)?;
+                dns_pipe = Some(value.as_str());
+            }
             [flag, value] if flag == "--shutdown-event" && shutdown_event.is_none() => {
                 shutdown_event = Some(value.as_str());
             }
@@ -76,12 +83,13 @@ fn observe_options(args: &[String]) -> Result<ObserveOptions<'_>> {
                 seen_log_file = true;
             }
             _ => anyhow::bail!(
-                "usage: redirector observe --session-file PATH [--shutdown-event NAME] [--log-file PATH]"
+                "usage: redirector observe --session-file PATH [--shutdown-event NAME] [--log-file PATH] [--dns-pipe NAME]"
             ),
         }
     }
     Ok(ObserveOptions {
         shutdown_event,
+        dns_pipe,
         session_file: session_file.ok_or_else(|| {
             anyhow::anyhow!("observe requires --session-file from the UI's current OpenVPN session")
         })?,
@@ -117,8 +125,17 @@ fn run_observe(options: ObserveOptions<'_>) -> Result<()> {
             vpn_state.clone(),
             bus.clone(),
             shutdown.clone(),
-            session,
+            session.clone(),
         ));
+        if let Some(name) = options.dns_pipe {
+            services.spawn(dns_broker::run(
+                name.to_owned(),
+                resolver.clone(),
+                vpn_state.clone(),
+                session,
+                shutdown.clone(),
+            ));
+        }
         services.spawn(status_server::run(bus.clone(), vpn_state.clone()));
         services.spawn(proc_watcher::run(
             policy_state.clone(),
@@ -210,7 +227,7 @@ fn print_help() {
     println!();
     println!("USAGE:");
     println!("  redirector [adapters]    List network adapters, flag VPN candidates");
-    println!("  redirector observe --session-file PATH [--shutdown-event NAME] [--log-file PATH]");
+    println!("  redirector observe --session-file PATH [--shutdown-event NAME] [--log-file PATH] [--dns-pipe NAME]");
     println!(
         "                          Run routing for the UI's bound VPN session (requires admin)"
     );

@@ -164,3 +164,43 @@ fn guid_case_and_braces_normalize_but_bad_separators_are_rejected() {
     assert!(guid("abcdef0011234-5678-9012-3456789abcde").is_err());
     assert!(guid("{abcdef00-1234-5678-9012-3456789abcde").is_err());
 }
+
+#[test]
+fn dns_metadata_is_optional_and_invalid_dns_does_not_invalidate_routing() {
+    assert!(binding().dns_metadata().unwrap().is_none());
+    let mut value = snapshot();
+    value["dns"] = json!({"status":"ready","generation":"30000000-0000-0000-0000-000000000003","servers":[{"address":"10.8.0.1","port":53}]});
+    let parse = |v: &Value| SessionBinding::parse(&serde_json::to_vec(v).unwrap()).unwrap();
+    assert_eq!(
+        parse(&value).dns_metadata().unwrap().unwrap().1,
+        ["10.8.0.1:53".parse::<SocketAddrV4>().unwrap()]
+    );
+    for invalid in [
+        "127.0.0.1",
+        "169.254.1.1",
+        "224.0.0.1",
+        "240.0.0.1",
+        "::1",
+        "8.8.8.8/32",
+        "1.2.3.04",
+    ] {
+        let mut bad = value.clone();
+        bad["dns"]["servers"][0]["address"] = json!(invalid);
+        assert!(parse(&bad).dns_metadata().is_err());
+        assert!(parse(&bad).validate(&[adapter()], Some(&process())).is_ok());
+    }
+    for status in ["unknown", "not-provided", "invalid", "unsupported"] {
+        let mut not_ready = value.clone();
+        not_ready["dns"]["status"] = json!(status);
+        assert!(parse(&not_ready).dns_metadata().unwrap().is_none());
+    }
+    for servers in [
+        json!([]),
+        json!([{"address":"10.8.0.1","port":5353}]),
+        json!([{"address":"10.8.0.1","port":53},{"address":"10.8.0.1","port":53}]),
+    ] {
+        let mut bad = value.clone();
+        bad["dns"]["servers"] = servers;
+        assert!(parse(&bad).dns_metadata().is_err());
+    }
+}

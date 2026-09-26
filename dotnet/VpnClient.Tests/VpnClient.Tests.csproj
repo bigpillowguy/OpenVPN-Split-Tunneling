@@ -25,6 +25,7 @@
     <Compile Include="../VpnClient.Ui/OvpnProfileImporter.cs" Link="Production/OvpnProfileImporter.cs" />
     <Compile Include="../VpnClient.Ui/OvpnRuntimeProfile.cs" Link="Production/OvpnRuntimeProfile.cs" />
     <Compile Include="../VpnClient.Ui/OpenVpnTunnelMetadata.cs" Link="Production/OpenVpnTunnelMetadata.cs" />
+    <Compile Include="../VpnClient.Ui/OpenVpnDnsMetadata.cs" Link="Production/OpenVpnDnsMetadata.cs" />
     <Compile Include="../VpnClient.Ui/VpnSessionBindingStore.cs" Link="Production/VpnSessionBindingStore.cs" />
     <Compile Include="../VpnClient.Ui/WindowsVpnAdapter.cs" Link="Production/WindowsVpnAdapter.cs" />
     <Compile Include="../VpnClient.Ui/VpnSessionController.cs" Link="Production/VpnSessionController.cs" />

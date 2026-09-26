@@ -202,6 +202,7 @@ public partial class MainWindow : FluentWindow
         EmptyAppsText.Visibility = _config.TunneledApps.Count == 0
             ? Visibility.Visible
             : Visibility.Collapsed;
+        RefreshConnectionState();
     }
 
     private static string FormatBytes(ulong bytes)

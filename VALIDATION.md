@@ -4,7 +4,10 @@
 `5f6273d22d29233699175935b5b3516c84383100`. [REVIEW.md](REVIEW.md) описывает эту
 точку, а [TODO.md](TODO.md) отслеживает исправления и оставшуюся приёмку.
 
-## Локальные результаты
+Актуальные результаты 1.2.0 находятся в последнем разделе. Предшествующие разделы
+сохраняют проверки пакета 1.0.x и исходные ограничения приёмки.
+
+## Локальные результаты 1.0.x
 
 Проверено на Windows x64 с Rust 1.98.1 MSVC, .NET SDK 10.0.400 и Inno Setup 6.7.3.
 Для Rust перед системным GNU toolchain поставлен каталог rustup:
@@ -149,3 +152,29 @@ handler на этом ПК не воспроизведён и не считае�
 GitHub Actions на commit `63df232` прошёл после закрепления SDK:
 [run 36237661483](https://github.com/bigpillowguy/OpenVPN-Split-Tunneling/actions/runs/36237661483).
 Результат CI для нового пакета учитывается отдельно от этого запуска и локальных тестов.
+
+## Windows VPN Platform и клиент 1.2.0
+
+UI сохраняет обычный запуск приложений и явно сообщает, что per-app VPN DNS
+пока не включён. DNS-метаданные OpenVPN и отдельный opt-in Rust transport
+сохранены для будущей интеграции. UI не запускает этот DNS broker.
+
+Проверено локально после изменения текущего дерева:
+
+- .NET locked restore, 153 теста и Release WPF build: успешно, без предупреждений.
+- Rust formatting, строгий workspace clippy, 90 тестов включая doctest: успешно.
+- Регрессия установщика: занятый старый компонент вызывает отказ без загрузки
+  его кода; проверены отсутствующий файл, удержание эксклюзивного write handle
+  до удаления и запрет новых читателей. Inno Setup compile-check прошёл.
+- Release redirector, self-contained WPF publish и установщик 1.2.0 собраны.
+  Пакет: 80 095 778 байт, SHA-256
+  `8C9244E0C73C0CEA852199A7478B55C6C1D0A3D230212B856A545341F66AA3F6`.
+  Установщик не запускался. Native staging и MSI/cache integrity tests прошли.
+- Windows VPN Platform имеет отдельные offline проверки и unsigned Appx.
+  Прошли 52 проверки DNS codec, 51 проверка реальных WinRT profile objects,
+  локальная COM-фабрика и MakeAppx (7 файлов пакета). Их ограничения записаны в
+  [BUILD-EVIDENCE.md](research/VpnPlatform/BUILD-EVIDENCE.md).
+
+Регистрация пакета и живое разделение DNS-контекстов ещё требуют новой VM.
+Никакой результат сборки не заменяет сетевую матрицу из
+[VM-RUNBOOK.md](research/VpnPlatform/VM-RUNBOOK.md).

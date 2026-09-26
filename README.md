@@ -18,10 +18,11 @@ profile and any credentials required by your provider.
   physical interface.
 - The client is **fail-open**: when the VPN is unavailable, selected applications
   may use the default route. This is not a kill switch or an anonymity boundary.
-- **DNS stays with Windows.** Local and server-pushed DNS/DHCP settings are
-  excluded from the runtime profile. There is no per-application DNS isolation:
-  Windows DNS Client, application-managed DNS and DoH may take different routes.
-  Private VPN-only hostnames may not resolve with the system DNS servers.
+- **DNS remains unchanged:** selecting an EXE does not isolate its DNS queries.
+  Local and server-pushed DNS/DHCP settings are excluded from the runtime profile.
+  System DNS configuration and the Windows DNS Client service remain unchanged.
+  Per-application VPN DNS is being investigated with Windows VPN Platform;
+  it is not enabled in the client. See [DNS-RESEARCH.md](DNS-RESEARCH.md).
 - Each connection uses a temporary profile that suppresses local/pushed routes,
   including `redirect-gateway` and IPv4 `/1` routes. The stored profile is preserved.
   OpenVPN still configures its tunnel interface; the redirector prepares a route
@@ -73,8 +74,8 @@ and diagnostic path displayed below the connection state. Each launch keeps
 `redirector.log` under `%LOCALAPPDATA%\VpnClient\runtime\<launch-id>\` with one
 rotated `.1` archive (up to 2 MiB each). Logs survive normal client shutdown;
 the session binding and temporary profile containing keys are removed.
-Version 1.0.1 fixes a backend exit triggered by normal zero-payload WinDivert
-SOCKET events. Close the client and install 1.0.1 when upgrading from 1.0.0.
+Version 1.2.0 preserves ordinary application startup and DNS while Windows VPN
+Platform is tested separately.
 
 Close this client's session before upgrading or uninstalling. Setup uses file
 ownership and Windows Restart Manager for in-use application files; it does not
@@ -132,7 +133,8 @@ OpenVPN 2.7's authenticated `management-up-down` events provide the interface
 index and gateway. The UI publishes them only after a matching `CONNECTED` event,
 and revokes the binding on reconnect, disconnect or process exit. The redirector
 requires this binding (`observe --session-file <path>`) and revalidates it every
-250 ms. `route-noexec` and `route-nopull` enforce the route/DNS policy; a nonexecuted
+250 ms. Authenticated management PUSH metadata supplies DNS separately, without
+applying it to the system. `route-noexec` and `route-nopull` enforce the route/DNS policy; a nonexecuted
 route supplies OpenVPN's gateway metadata. See the
 [OpenVPN 2.7 manual](https://openvpn.net/community-docs/community-articles/openvpn-2-7-manual.html).
 
@@ -166,7 +168,7 @@ The script enters the repository root, puts rustup before any older system Rust
 installation, checks MSVC, builds with `Cargo.lock`, publishes the UI, verifies
 NuGet dependencies against `packages.lock.json`, checks the WinDivert staging
 files, and compiles setup. It **never executes the setup**.
-The output is `installer/Output/VpnClientSetup-1.0.1.exe`.
+The output is `installer/Output/VpnClientSetup-1.2.0.exe`.
 
 The bundled OpenVPN download is pinned by SHA-256 and requires a valid OpenVPN
 Authenticode signature. Every cached use is checked; downloads are verified
@@ -180,12 +182,14 @@ $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
+./research/VpnPlatform/build.ps1 # offline checks and unsigned VM package only
 dotnet restore dotnet/VpnClient.Tests/VpnClient.Tests.csproj --locked-mode
 dotnet test dotnet/VpnClient.Tests/VpnClient.Tests.csproj -c Release --nologo --no-restore
 cargo build --locked --release -p redirector
 dotnet restore dotnet/VpnClient.Ui/VpnClient.Ui.csproj --locked-mode
 dotnet publish dotnet/VpnClient.Ui/VpnClient.Ui.csproj -c Release --no-restore
 ./installer/test-native-staging.ps1
+./installer/test-legacy-retirement.ps1
 ./installer/test-dependencies.ps1  # requires the verified MSI cache from build.ps1
 ```
 
@@ -200,7 +204,7 @@ and fail if the package graph disagrees with the committed lockfile.
 Windows CI is configured to check formatting, clippy and tests, and produce an
 unsigned installer artifact without installing OpenVPN or starting VPN/driver
 processes. Product/setup version
-`1.0.1` and internal Rust workspace crate version `0.1.0` are separate identifiers.
+`1.2.0` and internal Rust workspace crate version `0.1.0` are separate identifiers.
 
 ## Source layout and licenses
 
@@ -208,14 +212,15 @@ processes. Product/setup version
 | --- | --- |
 | `dotnet/VpnClient.Ui/` | WPF UI and VPN process management |
 | `redirector/` | Rust packet redirector |
+| `research/VpnPlatform/` | Windows VPN Platform per-application DNS experiment |
 | `ipc/` | Protobuf definitions and framing |
 | `installer/` | Build, prerequisite validation, setup, licenses |
 | `vendor/windivert/` | WinDivert 2.2.2 binaries and upstream license |
 | `vendor/windivert-rs/` | Patched Rust wrapper: metadata-only events and safe overlapped cancellation |
 | `supervisor/`, `ui/` | Experimental Rust tools |
 
-This project's own Rust and C# source is [MIT licensed](LICENSE). Third-party
+This project's own Rust, C# and C++ source is [MIT licensed](LICENSE). Third-party
 components retain their own licenses. Setup includes the client license,
-WinDivert's LGPLv3/GPL texts, and OpenVPN's GPLv2 text and linking exceptions
+WinDivert's LGPLv3/GPL texts and OpenVPN's GPLv2 text and linking exceptions
 under `licenses/`. See [third-party notices](installer/licenses/THIRD-PARTY-NOTICES.txt)
 for component origins and source links. OpenVPN remains a separate installation.

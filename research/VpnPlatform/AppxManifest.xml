@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+         xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+         xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+         IgnorableNamespaces="uap rescap">
+  <Identity Name="VpnPlatformResearch" Publisher="CN=VpnPlatformResearch" Version="1.0.0.0" ProcessorArchitecture="x64" />
+  <Properties>
+    <DisplayName>VPN DNS scope research</DisplayName>
+    <PublisherDisplayName>Local VM research</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.22000.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+  <Resources><Resource Language="en-us" /></Resources>
+  <Applications>
+    <Application Id="Provision" Executable="VpnPlatformProvision.exe" EntryPoint="VpnPlatform.Provision">
+      <uap:VisualElements DisplayName="VPN lab profile setup" Description="Explicit disposable-VM profile provisioning"
+         Square150x150Logo="Assets\Logo.png" Square44x44Logo="Assets\SmallLogo.png" BackgroundColor="#333333" AppListEntry="none" />
+    </Application>
+    <Application Id="Plugin" Executable="VpnPlatformProbe.exe" EntryPoint="VpnPlatform.ProbeTask">
+      <uap:VisualElements DisplayName="VPN DNS scope research" Description="VM-only DNS isolation experiment"
+         Square150x150Logo="Assets\Logo.png" Square44x44Logo="Assets\SmallLogo.png" BackgroundColor="#333333" AppListEntry="none" />
+      <Extensions>
+        <Extension Category="windows.backgroundTasks" Executable="VpnPlatformProbe.exe" EntryPoint="VpnPlatform.ProbeTask">
+          <BackgroundTasks><uap:Task Type="vpnClient" /></BackgroundTasks>
+        </Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+  <Capabilities>
+    <Capability Name="internetClientServer" />
+    <Capability Name="privateNetworkClientServer" />
+    <rescap:Capability Name="networkingVpnProvider" />
+  </Capabilities>
+  <Extensions>
+    <Extension Category="windows.activatableClass.inProcessServer">
+      <InProcessServer>
+        <Path>VpnPlatformProbe.dll</Path>
+        <ActivatableClass ActivatableClassId="VpnPlatform.ProbeTask" ThreadingModel="both" />
+      </InProcessServer>
+    </Extension>
+  </Extensions>
+</Package>

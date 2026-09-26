@@ -55,6 +55,10 @@
                                       FontTypography="Body"
                                       Foreground="{DynamicResource TextFillColorSecondaryBrush}"
                                       Margin="24,4,0,0" />
+                        <ui:TextBlock Text="Per-app VPN DNS is not enabled."
+                                      FontTypography="Caption" TextWrapping="Wrap"
+                                      Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                      Margin="24,4,12,0" />
                     </StackPanel>
                     <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
                         <ui:Button x:Name="VpnSettingsBtn"

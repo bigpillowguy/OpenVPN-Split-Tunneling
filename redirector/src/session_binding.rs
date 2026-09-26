@@ -5,7 +5,7 @@
 
 use std::fs::File;
 use std::io::Read;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -17,9 +17,21 @@ use crate::process::{ProcessInfo, Resolver};
 
 const MAX_SNAPSHOT_BYTES: u64 = 16 * 1024;
 
+#[derive(Clone)]
 pub struct SessionSource {
     path: PathBuf,
     resolver: Arc<Resolver>,
+}
+
+/// A DNS lease is specific to both the live VPN owner and the provider metadata.
+/// Equality is deliberately stronger than equality of the adapter IP/index.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DnsSession {
+    pub target: VpnTarget,
+    pub generation: [u8; 16],
+    pub servers: Vec<SocketAddrV4>,
+    pub open_vpn_pid: u32,
+    pub open_vpn_creation_time: u64,
 }
 
 impl SessionSource {
@@ -42,6 +54,24 @@ impl SessionSource {
         binding
             .validate(&adapter::enumerate()?, process.as_ref())
             .map(Some)
+    }
+
+    pub fn current_dns(&self) -> Result<Option<DnsSession>> {
+        let Some(binding) = read_snapshot(&self.path)? else {
+            return Ok(None);
+        };
+        let Some((generation, servers)) = binding.dns_metadata()? else {
+            return Ok(None);
+        };
+        let process = self.resolver.resolve(binding.open_vpn_pid);
+        let target = binding.validate(&adapter::enumerate()?, process.as_ref())?;
+        Ok(Some(DnsSession {
+            target,
+            generation,
+            servers,
+            open_vpn_pid: binding.open_vpn_pid,
+            open_vpn_creation_time: binding.open_vpn_creation_time,
+        }))
     }
 }
 
@@ -69,6 +99,7 @@ struct SessionBinding {
     interface_index: u32,
     ipv4: Ipv4Addr,
     gateway: Ipv4Addr,
+    dns: Option<Value>,
 }
 
 impl SessionBinding {
@@ -116,7 +147,49 @@ impl SessionBinding {
             interface_index,
             ipv4,
             gateway,
+            dns: fields.get("dns").cloned(),
         })
+    }
+
+    fn dns_metadata(&self) -> Result<Option<([u8; 16], Vec<SocketAddrV4>)>> {
+        let Some(value) = &self.dns else {
+            return Ok(None);
+        };
+        if value.is_null() {
+            return Ok(None);
+        }
+        let fields = value
+            .as_object()
+            .context("DNS metadata must be an object")?;
+        match string(fields, "status")? {
+            "unknown" | "not-provided" | "invalid" | "unsupported" => return Ok(None),
+            "ready" => {}
+            _ => bail!("unknown DNS metadata status"),
+        }
+        let generation = guid(string(fields, "generation")?)?;
+        let entries = fields
+            .get("servers")
+            .and_then(Value::as_array)
+            .context("DNS servers must be an array")?;
+        if entries.is_empty() || entries.len() > 4 {
+            bail!("DNS requires one to four servers")
+        }
+        let mut servers = Vec::new();
+        for entry in entries {
+            let fields = entry.as_object().context("DNS server must be an object")?;
+            let ip: Ipv4Addr = string(fields, "address")?
+                .parse()
+                .context("unsupported DNS address")?;
+            if !usable_unicast(ip) || number(fields, "port")? != 53 {
+                bail!("only unicast IPv4 provider DNS on port 53 is supported");
+            }
+            let server = SocketAddrV4::new(ip, 53);
+            if servers.contains(&server) {
+                bail!("duplicate DNS server")
+            }
+            servers.push(server);
+        }
+        Ok(Some((generation, servers)))
     }
 
     fn validate(&self, adapters: &[Adapter], process: Option<&ProcessInfo>) -> Result<VpnTarget> {

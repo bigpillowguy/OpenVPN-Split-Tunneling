@@ -20,6 +20,8 @@ internal sealed class OpenVpnSession : IVpnSession
     private SessionSecrets? _secrets;
     private VpnSessionBindingStore.Lease? _binding;
     private readonly OpenVpnTunnelMetadata _tunnel = new();
+    private OpenVpnDnsMetadata _dns = new();
+    private Guid? _boundSession;
     private TcpClient? _tcp;
     private StreamWriter? _writer;
     private Task? _readerTask;
@@ -43,6 +45,7 @@ internal sealed class OpenVpnSession : IVpnSession
         ManagementProtocol.Quote(_profile.GetPassword());
         ct.ThrowIfCancellationRequested();
         _secrets = new SessionSecrets();
+        _dns = new OpenVpnDnsMetadata(OpenVpnDnsMetadata.HasLocalDns(OvpnProfileImporter.LoadExpanded(_profile.FilePath)));
         var runtimeProfile = OvpnRuntimeProfile.Create(_profile.FilePath, _secrets.DirectoryPath);
         _binding = Redirector.BeginSessionBinding();
         var listener = new TcpListener(IPAddress.Loopback, 0);
@@ -56,7 +59,8 @@ internal sealed class OpenVpnSession : IVpnSession
         foreach (var argument in new[] { "--config", runtimeProfile, "--management", "127.0.0.1", port.ToString(),
                      _secrets.PasswordFile, "--management-query-passwords", "--management-hold", "--management-signal",
                      "--management-up-down",
-                     "--log", Path.Combine(_secrets.DirectoryPath, "openvpn.log"), "--verb", "3" })
+                     // Raw PUSH/LOG may contain secrets not covered by upstream redaction.
+                     "--log", "NUL", "--verb", "3", "--mute", "0" })
             psi.ArgumentList.Add(argument);
         if (requiresAuth) psi.ArgumentList.Add("--auth-user-pass");
         // OpenVPN reports the device it actually opened through the authenticated management channel.
@@ -66,7 +70,7 @@ internal sealed class OpenVpnSession : IVpnSession
         while (true)
         {
             startup.Token.ThrowIfCancellationRequested();
-            if (_process.HasExited) throw new InvalidOperationException(Failure ?? "OpenVPN exited during startup. Inspect the session log.");
+            if (_process.HasExited) throw new InvalidOperationException(Failure ?? "OpenVPN exited during startup. Check the profile and credentials.");
             var client = new TcpClient();
             try
             {
@@ -80,10 +84,11 @@ internal sealed class OpenVpnSession : IVpnSession
         var stream = _tcp.GetStream();
         if (!LoopbackPeer.IsOwnedBy(_tcp, _process.Id))
             throw new InvalidOperationException("The management connection does not belong to the OpenVPN process we started.");
-        var reader = new StreamReader(stream, Encoding.UTF8, false, 4096, leaveOpen: true);
+        var reader = new StreamReader(stream, new UTF8Encoding(false, true), false, 4096, leaveOpen: true);
         _writer = new StreamWriter(stream, new UTF8Encoding(false), 4096, leaveOpen: true) { AutoFlush = true, NewLine = "\n" };
         await ManagementProtocol.AuthenticateAsync(reader, _writer, _secrets.Password, startup.Token).ConfigureAwait(false);
         _secrets.ReleasePasswordFile();
+        await ManagementProtocol.EnableRealtimeLogAsync(reader, _writer, line => _dns.Consume(line), startup.Token).ConfigureAwait(false);
         _readerTask = ReadManagementAsync(reader, _lifetime.Token);
         await SendAsync("state on", startup.Token).ConfigureAwait(false);
         await SendAsync("hold off", startup.Token).ConfigureAwait(false);
@@ -95,9 +100,14 @@ internal sealed class OpenVpnSession : IVpnSession
     {
         try
         {
-            while (await ReadLineAsync(reader, ct).ConfigureAwait(false) is { } line)
+            while (await ManagementProtocol.ReadLineAsync(reader, ct).ConfigureAwait(false) is { } line)
             {
-                if (line.StartsWith(">PASSWORD:Need 'Auth'", StringComparison.Ordinal) && !line.Contains("SC:", StringComparison.Ordinal))
+                if (line.StartsWith(">LOG:", StringComparison.Ordinal))
+                {
+                    if (_dns.Consume(line) && _boundSession is { } sessionId)
+                        _binding?.UpdateDns(sessionId, _dns.Current);
+                }
+                else if (line.StartsWith(">PASSWORD:Need 'Auth'", StringComparison.Ordinal) && !line.Contains("SC:", StringComparison.Ordinal))
                 {
                     await SendAsync("username \"Auth\" " + ManagementProtocol.Quote(_profile.Username), ct).ConfigureAwait(false);
                     await SendAsync("password \"Auth\" " + ManagementProtocol.Quote(_profile.GetPassword()), ct).ConfigureAwait(false);
@@ -108,7 +118,11 @@ internal sealed class OpenVpnSession : IVpnSession
                 {
                     if (line is ">UPDOWN:UP" or ">UPDOWN:DOWN")
                     {
+                        _boundSession = null;
                         _binding?.Revoke();
+                        // PUSH arrives before UP: preserve its DNS candidate. DOWN
+                        // and RECONNECTING invalidate it before the next attempt.
+                        if (line == ">UPDOWN:DOWN") _dns.Reset();
                         ConnectionChanged?.Invoke(this, false);
                     }
                     _tunnel.Consume(line);
@@ -121,19 +135,22 @@ internal sealed class OpenVpnSession : IVpnSession
                         var tunnel = _tunnel.Current ?? throw new InvalidDataException("OpenVPN connected without fresh tunnel identity metadata.");
                         if (fields.Length < 4) throw new InvalidDataException("OpenVPN omitted its connected IPv4 address.");
                         var adapter = WindowsVpnAdapter.Resolve(tunnel, OpenVpnTunnelMetadata.ParseIpv4(fields[3]));
-                        _binding!.Publish(_process!, tunnel, adapter);
+                        _binding!.Publish(_process!, tunnel, adapter, _dns.OnConnected());
+                        _boundSession = tunnel.SessionId;
                         _connected.TrySetResult();
                         ConnectionChanged?.Invoke(this, true);
                     }
                     else if (fields.Length > 1 && fields[1] is "RECONNECTING" or "EXITING")
                     {
                         _binding?.Revoke();
+                        _boundSession = null;
                         _tunnel.Reset();
+                        _dns.Reset();
                         ConnectionChanged?.Invoke(this, false);
                     }
                 }
                 else if (line.StartsWith(">FATAL:", StringComparison.Ordinal))
-                    throw new InvalidOperationException("OpenVPN reported a fatal error. Inspect the session log.");
+                    throw new InvalidOperationException("OpenVPN reported a fatal error. Check the profile, credentials and VPN server availability.");
             }
             if (!_stopping) throw new EndOfStreamException("OpenVPN management disconnected.");
         }
@@ -161,7 +178,7 @@ internal sealed class OpenVpnSession : IVpnSession
             await process.WaitForExitAsync().ConfigureAwait(false);
             if (!_stopping)
             {
-                Failure ??= $"OpenVPN exited with code {process.ExitCode}. Inspect the session log.";
+                Failure ??= $"OpenVPN exited with code {process.ExitCode}. Check the profile and credentials.";
                 _connected.TrySetException(new InvalidOperationException(Failure));
             }
         }
@@ -217,19 +234,6 @@ internal sealed class OpenVpnSession : IVpnSession
         _tcp?.Dispose();
         _process?.Dispose();
         _secrets?.Dispose();
-    }
-
-    private static async Task<string?> ReadLineAsync(StreamReader reader, CancellationToken ct)
-    {
-        var line = new StringBuilder();
-        var character = new char[1];
-        while (await reader.ReadAsync(character.AsMemory(), ct).ConfigureAwait(false) != 0)
-        {
-            if (character[0] == '\n') return line.ToString().TrimEnd('\r');
-            if (line.Length >= 8192) throw new InvalidDataException("OpenVPN management line exceeds the supported limit.");
-            line.Append(character[0]);
-        }
-        return line.Length == 0 ? null : throw new EndOfStreamException("OpenVPN management frame was truncated.");
     }
 
     private void RevokeBinding()
